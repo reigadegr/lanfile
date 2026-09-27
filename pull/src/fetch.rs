@@ -123,7 +123,7 @@ pub async fn fetch_file(
     let buffered = reader.buffer().to_vec();
     let stream = reader.into_inner();
 
-    let (copied, via, stream) =
+    let (fetched, stream) =
         match copy_in_blocking(stream, buffered, local.to_path_buf(), want).await {
             Ok(landed) => landed,
             Err(error) => {
@@ -132,21 +132,21 @@ pub async fn fetch_file(
             }
         };
 
-    if copied != want {
+    if fetched.bytes != want {
         discard(local).await;
         return Err(Error::Truncated {
             remote: remote.to_string(),
             want,
-            got: copied,
+            got: fetched.bytes,
         });
     }
     // 把 socket 切回异步、包回 `BufReader` 归还复用。
     let stream = tokio::net::TcpStream::from_std(stream)?;
     pool.release(BufReader::new(stream));
-    Ok(Fetched { bytes: copied, via })
+    Ok(fetched)
 }
 
-/// 在阻塞线程里把正文从 socket 搬进文件，返回落盘字节数、搬运方式与归还的 socket。
+/// 在阻塞线程里把正文从 socket 搬进文件，返回落盘结果与归还的 socket。
 ///
 /// 读 socket 与写文件都在同一个阻塞线程里用同步 IO 完成：tokio 的 `fs::File` 每次
 /// `write` 都要把缓冲搬到 blocking pool，异步 socket 每次 `read` 都要过一遍 reactor
@@ -161,16 +161,16 @@ async fn copy_in_blocking(
     buffered: Vec<u8>,
     target: PathBuf,
     want: u64,
-) -> Result<(u64, Via, std::net::TcpStream), Error> {
+) -> Result<(Fetched, std::net::TcpStream), Error> {
     tokio::task::spawn_blocking(move || {
         // `into_std` 只把 fd 转回 std，不改变阻塞模式；tokio 的 socket 是非阻塞的，
         // 要做同步读就得先切回阻塞。
         let stream = stream.into_std()?;
         stream.set_nonblocking(false)?;
-        let (copied, via) = copy_sync(&stream, &buffered, &target, want)?;
+        let fetched = copy_sync(&stream, &buffered, &target, want)?;
         // 交还前切回非阻塞，否则 `from_std` 之后 reactor 会在错误的前提上注册 fd。
         stream.set_nonblocking(true)?;
-        Ok::<_, Error>((copied, via, stream))
+        Ok::<_, Error>((fetched, stream))
     })
     .await
     .map_err(|join| Error::Io(io::Error::other(join)))?
@@ -186,7 +186,7 @@ fn copy_sync(
     buffered: &[u8],
     target: &Path,
     want: u64,
-) -> Result<(u64, Via), Error> {
+) -> Result<Fetched, Error> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut file = std::fs::File::create(target)?;
 
@@ -198,7 +198,10 @@ fn copy_sync(
     }
 
     let (copied, via) = copy_body(stream, &file, want - take as u64)?;
-    Ok((take as u64 + copied, via))
+    Ok(Fetched {
+        bytes: take as u64 + copied,
+        via,
+    })
 }
 
 /// 把剩下的正文搬进文件（接着当前文件偏移写），返回落盘字节数与搬运方式。
