@@ -4,11 +4,15 @@
 //! 写文件那一头走不走得通取决于文件系统有没有实现 `splice_write`（ext4、xfs、btrfs、tmpfs 都有，
 //! procfs 之类没有），因此先拿空管道探一次能力，探不通就把正文原样留给调用方的用户态读写——
 //! 这条路径只是加速，不支持不影响正确性。
+//!
+//! 管道按 blocking 线程复用：`pipe_with` 一次要分配两个 fd 与一份内核 pipe 结构，一根管道在
+//! 同一个线程上可以跨多次 `transfer` 复用，一趟拉取下来只建一次。
 
 use crate::error::Error;
 use rustix::fd::OwnedFd;
 use rustix::io::Errno;
 use rustix::pipe::{PipeFlags, SpliceFlags, pipe_with, splice};
+use std::cell::RefCell;
 use std::fs::File;
 use std::io;
 use std::net::TcpStream;
@@ -25,19 +29,54 @@ pub enum Moved {
     Unsupported,
 }
 
+thread_local! {
+    /// 本 blocking 线程复用的管道：socket 与文件之间的中转缓冲。
+    ///
+    /// 一次 `lanfile get` 里所有文件都由 tokio 的 blocking 线程池处理，池里线程数远少于
+    /// 文件数，因此同一线程上的复用命中率很高。管道里可能因为上次传输中途失败而残留数据，
+    /// 出错时不归还，直接丢弃重建。
+    static PIPE: RefCell<Option<(OwnedFd, OwnedFd)>> = const { RefCell::new(None) };
+}
+
 /// 把正文从 `stream` 搬进 `file`（接着当前文件偏移写），最多 `want` 字节。
 ///
 /// 返回 [`Moved::Unsupported`] 时 socket 上一个字节都没被读走，调用方可以原样改用用户态读写。
 pub fn transfer(stream: &TcpStream, file: &File, want: u64) -> Result<Moved, Error> {
-    let (pipe_read, pipe_write) = pipe_with(PipeFlags::CLOEXEC).map_err(io::Error::from)?;
-    if !supported(&pipe_read, file) {
+    PIPE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let (pipe_read, pipe_write) = match slot.take() {
+            Some(pipe) => pipe,
+            None => pipe_with(PipeFlags::CLOEXEC).map_err(io::Error::from)?,
+        };
+        match transfer_inner(stream, &pipe_read, &pipe_write, file, want) {
+            Ok(moved) => {
+                // `Done` 已把所有字节从管道里 drain 走，`Unsupported` 一个字节都没写，
+                // 两种情况管道里都是空的，可以安全复用。
+                *slot = Some((pipe_read, pipe_write));
+                Ok(moved)
+            }
+            // 出错时管道里可能残留字节：与其猜测状态，不如丢弃重建
+            Err(error) => Err(error),
+        }
+    })
+}
+
+/// [`transfer`] 去掉管道获取与归还的部分。
+fn transfer_inner(
+    stream: &TcpStream,
+    pipe_read: &OwnedFd,
+    pipe_write: &OwnedFd,
+    file: &File,
+    want: u64,
+) -> Result<Moved, Error> {
+    if !supported(pipe_read, file) {
         return Ok(Moved::Unsupported);
     }
 
     let mut total = 0_u64;
     while total < want {
         let room = (want - total).min(CHUNK as u64) as usize;
-        let read = match splice(stream, None, &pipe_write, None, room, SpliceFlags::MOVE) {
+        let read = match splice(stream, None, pipe_write, None, room, SpliceFlags::MOVE) {
             // 对端提前收尾：剩下的交给调用方按截断处理
             Ok(0) => break,
             Ok(n) => n,
@@ -51,7 +90,7 @@ pub fn transfer(stream: &TcpStream, file: &File, want: u64) -> Result<Moved, Err
             Err(error) => return Err(Error::Io(error.into())),
         };
         total += read as u64;
-        drain(&pipe_read, file, read)?;
+        drain(pipe_read, file, read)?;
     }
     Ok(Moved::Done(total))
 }
