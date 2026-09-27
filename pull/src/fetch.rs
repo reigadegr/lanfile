@@ -81,6 +81,28 @@ pub async fn list_entries(
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
+/// 一次抓取里正文（`BufReader` 预读之外的那部分）走的搬运方式。
+///
+/// 拉完给用户汇报「几个文件吃上了 `splice`」时就按它分类。
+#[derive(Clone, Copy, Debug)]
+pub enum Via {
+    /// 内核 `splice(2)` 零拷贝：socket → 管道 → 文件。
+    Splice,
+    /// 用户态 `read` + `write`：非 Linux/Android，或目标文件系统没有 `splice_write`。
+    Copy,
+    /// 没有需要搬运的正文：全在 `BufReader` 的预读缓冲里（小文件都是这一支）。
+    Prebuffered,
+}
+
+/// 一次文件落盘的结果。
+#[derive(Debug)]
+pub struct Fetched {
+    /// 落盘字节数。
+    pub bytes: u64,
+    /// 正文走的搬运方式。
+    pub via: Via,
+}
+
 /// 拉一个文件到 `local`：正文按响应声明的 `Content-Length` 精确读满即停。
 ///
 /// 读满后连接干净，归还池子给下一个文件复用；服务端提前 EOF（读到的字节数不足声明的长度）
@@ -91,7 +113,7 @@ pub async fn fetch_file(
     host: &str,
     remote: &str,
     local: &Path,
-) -> Result<u64, Error> {
+) -> Result<Fetched, Error> {
     let path = format!("/pull/{}", encode_path(remote));
     let (reader, declared) = http_get(pool, host, &path).await?;
     let want = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
@@ -101,14 +123,14 @@ pub async fn fetch_file(
     let buffered = reader.buffer().to_vec();
     let stream = reader.into_inner();
 
-    let (copied, stream) = match copy_in_blocking(stream, buffered, local.to_path_buf(), want).await
-    {
-        Ok(pair) => pair,
-        Err(error) => {
-            discard(local).await;
-            return Err(error);
-        }
-    };
+    let (copied, via, stream) =
+        match copy_in_blocking(stream, buffered, local.to_path_buf(), want).await {
+            Ok(landed) => landed,
+            Err(error) => {
+                discard(local).await;
+                return Err(error);
+            }
+        };
 
     if copied != want {
         discard(local).await;
@@ -121,10 +143,10 @@ pub async fn fetch_file(
     // 把 socket 切回异步、包回 `BufReader` 归还复用。
     let stream = tokio::net::TcpStream::from_std(stream)?;
     pool.release(BufReader::new(stream));
-    Ok(copied)
+    Ok(Fetched { bytes: copied, via })
 }
 
-/// 在阻塞线程里把正文从 socket 搬进文件，返回落盘字节数与归还的 socket。
+/// 在阻塞线程里把正文从 socket 搬进文件，返回落盘字节数、搬运方式与归还的 socket。
 ///
 /// 读 socket 与写文件都在同一个阻塞线程里用同步 IO 完成：tokio 的 `fs::File` 每次
 /// `write` 都要把缓冲搬到 blocking pool，异步 socket 每次 `read` 都要过一遍 reactor
@@ -139,16 +161,16 @@ async fn copy_in_blocking(
     buffered: Vec<u8>,
     target: PathBuf,
     want: u64,
-) -> Result<(u64, std::net::TcpStream), Error> {
+) -> Result<(u64, Via, std::net::TcpStream), Error> {
     tokio::task::spawn_blocking(move || {
         // `into_std` 只把 fd 转回 std，不改变阻塞模式；tokio 的 socket 是非阻塞的，
         // 要做同步读就得先切回阻塞。
         let stream = stream.into_std()?;
         stream.set_nonblocking(false)?;
-        let copied = copy_sync(&stream, &buffered, &target, want)?;
+        let (copied, via) = copy_sync(&stream, &buffered, &target, want)?;
         // 交还前切回非阻塞，否则 `from_std` 之后 reactor 会在错误的前提上注册 fd。
         stream.set_nonblocking(true)?;
-        Ok::<_, Error>((copied, stream))
+        Ok::<_, Error>((copied, via, stream))
     })
     .await
     .map_err(|join| Error::Io(io::Error::other(join)))?
@@ -164,7 +186,7 @@ fn copy_sync(
     buffered: &[u8],
     target: &Path,
     want: u64,
-) -> Result<u64, Error> {
+) -> Result<(u64, Via), Error> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut file = std::fs::File::create(target)?;
     let mut total = 0_u64;
@@ -177,29 +199,34 @@ fn copy_sync(
         total = take as u64;
     }
 
-    total += copy_body(stream, &file, want - total)?;
+    let (copied, via) = copy_body(stream, &file, want - total)?;
+    total += copied;
     file.flush()?;
-    Ok(total)
+    Ok((total, via))
 }
 
-/// 把剩下的正文搬进文件（接着当前文件偏移写），返回落盘字节数。
+/// 把剩下的正文搬进文件（接着当前文件偏移写），返回落盘字节数与搬运方式。
 ///
 /// 目标支持 `splice(2)` 时走内核零拷贝，否则退回用户态读写——两边都读到 `want` 字节即止、
 /// 都用同一个 socket 空闲超时，调用方看到的字节数与截断语义完全一致。
-fn copy_body(stream: &std::net::TcpStream, file: &std::fs::File, want: u64) -> Result<u64, Error> {
+fn copy_body(
+    stream: &std::net::TcpStream,
+    file: &std::fs::File,
+    want: u64,
+) -> Result<(u64, Via), Error> {
     // 正文已经全在 `BufReader` 的预读里（小文件都是这一支）就没什么可搬的，别白建一根管道
     if want == 0 {
-        return Ok(0);
+        return Ok((0, Via::Prebuffered));
     }
     // 非 Linux/Android 没有 `splice(2)`，整段不编译，直接落到下面的用户态读写
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         match transfer(stream, file, want)? {
-            Moved::Done(copied) => return Ok(copied),
+            Moved::Done(copied) => return Ok((copied, Via::Splice)),
             Moved::Unsupported => {}
         }
     }
-    copy_read_write(stream, file, want)
+    Ok((copy_read_write(stream, file, want)?, Via::Copy))
 }
 
 /// 用户态搬运：一次 `read` 加一次 `write` 处理 [`COPY_BUF`] 字节，读满 `want` 即停，或用完
@@ -404,12 +431,17 @@ mod tests {
         let f1 = dir.join("a.bin");
         let f2 = dir.join("b.bin");
         let mut pool = Pool::default();
-        fetch_file(&mut pool, &addr.to_string(), "a.bin", &f1)
+        let first = fetch_file(&mut pool, &addr.to_string(), "a.bin", &f1)
             .await
             .unwrap();
-        fetch_file(&mut pool, &addr.to_string(), "b.bin", &f2)
+        let second = fetch_file(&mut pool, &addr.to_string(), "b.bin", &f2)
             .await
             .unwrap();
+        // 3 字节正文必然落在 `BufReader` 的预读里：既没走 splice 也没走用户态搬运
+        assert!(
+            matches!(first.via, Via::Prebuffered) && matches!(second.via, Via::Prebuffered),
+            "预读缓冲里的正文被算成了搬运"
+        );
         assert_eq!(std::fs::read(&f1).unwrap(), b"aaa");
         assert_eq!(std::fs::read(&f2).unwrap(), b"bbb");
         server.await.unwrap();
@@ -452,7 +484,15 @@ mod tests {
         let copied = fetch_file(&mut pool, &addr.to_string(), "big1.bin", &f1)
             .await
             .unwrap();
-        assert_eq!(copied, LEN as u64, "落盘字节数与 Content-Length 不一致");
+        assert_eq!(
+            copied.bytes, LEN as u64,
+            "落盘字节数与 Content-Length 不一致"
+        );
+        // 200 KB 正文远超预读缓冲，必然落进 splice 或用户态读写其中一条
+        assert!(
+            !matches!(copied.via, Via::Prebuffered),
+            "预读缓冲之外的正文被算成了无需搬运"
+        );
         fetch_file(&mut pool, &addr.to_string(), "big2.bin", &f2)
             .await
             .unwrap();

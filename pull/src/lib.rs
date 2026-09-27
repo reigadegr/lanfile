@@ -34,7 +34,7 @@ mod splice;
 pub use error::{BoxError, Error};
 
 use crate::args::{Kind, Parsed, parse_args};
-use crate::fetch::{RemoteEntry, fetch_file, list_entries};
+use crate::fetch::{RemoteEntry, Via, fetch_file, list_entries};
 use crate::http::Pool;
 use std::path::{Path, PathBuf};
 
@@ -69,6 +69,50 @@ struct Stats {
     files: u64,
     dirs: u64,
     bytes: u64,
+    /// 正文搬运方式的文件计数，拉完汇报「几个吃上 `splice`」用。
+    via: ViaCounts,
+}
+
+/// 落盘文件按正文搬运方式分类的文件数。
+///
+/// `splice(2)` 走不走得通是平台与文件系统的事，一趟拉取下来通常是同一个结果；这里按文件
+/// 数记，是为了让「确实吃上了没有」一眼可见——小文件正文在 `BufReader` 的预读里，
+/// 压根没东西可搬，单独记一档，免得跟「不支持」混在一起。
+#[derive(Default)]
+struct ViaCounts {
+    spliced: u64,
+    copied: u64,
+    prebuffered: u64,
+}
+
+impl ViaCounts {
+    /// 记一次落盘走的搬运方式。
+    const fn record(&mut self, via: Via) {
+        match via {
+            Via::Splice => self.spliced += 1,
+            Via::Copy => self.copied += 1,
+            Via::Prebuffered => self.prebuffered += 1,
+        }
+    }
+
+    /// 把子目录递归上来的计数并进来。
+    const fn merge(&mut self, sub: &Self) {
+        self.spliced += sub.spliced;
+        self.copied += sub.copied;
+        self.prebuffered += sub.prebuffered;
+    }
+
+    /// 拉完在末尾汇报：几个文件吃上了 `splice(2)` 零拷贝、几个没吃上退回用户态读写、几个
+    /// 压根不用搬。一个文件都没落盘就不吭声。
+    fn report(&self) {
+        if self.spliced + self.copied + self.prebuffered == 0 {
+            return;
+        }
+        eprintln!(
+            "lanfile get: 正文搬运：{} 个文件经 splice(2) 零拷贝，{} 个文件退回用户态读写，{} 个文件正文未超过预读缓冲",
+            self.spliced, self.copied, self.prebuffered
+        );
+    }
 }
 
 /// 把 404 转成"远端不存在"；其他错误原样返回。
@@ -116,6 +160,7 @@ async fn pull_dir_run(pool: &mut Pool, p: &Parsed, entries: Vec<RemoteEntry>) ->
         stats.bytes,
         stats.dirs
     );
+    stats.via.report();
     Ok(())
 }
 
@@ -127,12 +172,16 @@ async fn pull_file_run(pool: &mut Pool, p: &Parsed) -> Result<(), Error> {
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let bytes = fetch_file(pool, &p.host, remote, &target).await?;
+    let fetched = fetch_file(pool, &p.host, remote, &target).await?;
     eprintln!(
-        "lanfile get: {}/{remote} -> {}（{bytes} 字节）",
+        "lanfile get: {}/{remote} -> {}（{} 字节）",
         p.base,
-        target.display()
+        target.display(),
+        fetched.bytes
     );
+    let mut via = ViaCounts::default();
+    via.record(fetched.via);
+    via.report();
     Ok(())
 }
 
@@ -193,11 +242,15 @@ async fn pull_entries(
             stats.files += sub.files;
             stats.dirs += sub.dirs;
             stats.bytes += sub.bytes;
+            stats.via.merge(&sub.via);
         } else {
             let remote_size = entry.size;
             if !skip_existing(&local_child, remote_size).await {
                 match fetch_file(pool, host, &remote_child, &local_child).await {
-                    Ok(n) => stats.bytes += n,
+                    Ok(fetched) => {
+                        stats.bytes += fetched.bytes;
+                        stats.via.record(fetched.via);
+                    }
                     Err(error) => eprintln!("  跳过 {remote_child}：{error}"),
                 }
             }
