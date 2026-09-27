@@ -102,28 +102,48 @@ fn sort_list_entries(entries: &mut [ListEntry]) {
     });
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-/// 枚举目录并返回排序后的条目；路径非法或非目录返回 `None`。
-/// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
-fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
-    let dir = resolve_under(root, path)?;
+/// 目录里的一条原始条目：平台原语交给共用逻辑的全部信息。
+///
+/// 符号链接在产生它的原语里就被丢掉了（不展示给前端：`/files` 下载同样拒绝，
+/// 避免出现下载即 404 的条目），所以这里没有它——名字的 `String` 因此也不会
+/// 为一条注定要丢的条目分配。
+struct RawEntry {
+    /// 条目名（已按 `to_string_lossy` 处理非 UTF-8 字节）
+    name: String,
+    /// 是否目录
+    is_dir: bool,
+    /// 文件长度，目录上的取值无意义
+    size: u64,
+    /// 修改时间，`%Y-%m-%dT%H:%M:%S` 文本；取不到时为空串
+    modified: String,
+}
 
+/// 平台原语：把 `dir` 下每一条要展示的条目交给 `emit`。
+///
+/// 契约（[`list_directory`] 完全建立在这三条上）：
+/// - 打不开目录返回 `None`；
+/// - 不交出 `.` 与 `..`，也不交出符号链接；
+/// - 单个条目读不出来就跳过它，绝不因此放弃整次列举。
+///
+/// 逐条回调而不是先攒成 `Vec`：原版就是一个 `Vec`、一次分配，中间再攒一层等于
+/// 每个目录多一次堆分配；回调也让名字的 `String` 从原语直接移进调用方的 `Vec`，
+/// 中间没有第二次搬运。闭包会被单态化，机器码与手写展开一致。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
     // 1. openat 打开目录 fd
     //    OFlags::DIRECTORY 隐含 is_dir 检查，省 1 次 stat
-    let Ok(dirfd) = fs::openat(
+    let dirfd = fs::openat(
         fs::CWD,
-        &dir,
+        dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    ) else {
-        return None;
-    };
+    )
+    .ok()?;
 
     // 2. RawDir 用栈缓冲遍历（零堆分配，vs std read_dir 内部 Vec）
     let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
     let mut raw_dir = RawDir::new(&dirfd, &mut buf);
 
-    let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
     while let Some(entry) = raw_dir.next() {
         let Ok(entry) = entry else {
             continue;
@@ -137,85 +157,64 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
             continue;
         }
 
-        // 4. d_type 判断类型（零 syscall，来自 dirent）
-        let ft = entry.file_type();
-
-        // 5. statat 相对 dirfd 获取 size + mtime
+        // 4. statat 相对 dirfd 获取 size + mtime
         //    SYMLINK_NOFOLLOW 不跟随符号链接（比 std metadata() 更安全）
         //    相对路径解析比绝对路径更快
         let Ok(stat) = fs::statat(&dirfd, name_cstr, AtFlags::SYMLINK_NOFOLLOW) else {
             continue;
         };
 
-        // d_type 为 Unknown 时回退到 stat 的 st_mode
+        // 5. d_type 判断类型（零 syscall，来自 dirent）；Unknown 时回退到 stat 的 st_mode
+        let ft = entry.file_type();
         let actual_ft = if ft == FileType::Unknown {
             FileType::from_raw_mode(stat.st_mode)
         } else {
             ft
         };
 
-        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目
+        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目。
+        // 判断放在分配名字之前，符号链接多时不必为注定丢弃的条目付一次 String。
         if actual_ft.is_symlink() {
             continue;
         }
 
-        let is_dir = actual_ft.is_dir();
-
-        // 6. 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
-        let name = String::from_utf8_lossy(name_bytes).into_owned();
-        let entry_type = if is_dir { "dir" } else { "file" };
-        let size = if is_dir {
-            None
-        } else {
-            #[allow(clippy::cast_sign_loss)]
-            Some(stat.st_size as u64)
-        };
-
-        // 7. 直接读 st_mtime（跳过 SystemTime → Duration → as_secs 转换链）
+        // 6. 直接读 st_mtime（跳过 SystemTime → Duration → as_secs 转换链）
         let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0)
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
 
-        list_entries.push(ListEntry {
-            name,
-            entry_type,
-            size,
+        emit(RawEntry {
+            // 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
+            name: String::from_utf8_lossy(name_bytes).into_owned(),
+            is_dir: actual_ft.is_dir(),
+            #[allow(clippy::cast_sign_loss)]
+            size: stat.st_size as u64,
             modified,
         });
     }
-
-    sort_list_entries(&mut list_entries);
-
-    Some(list_entries)
+    Some(())
 }
 
+/// 非 Linux/Android（Windows、macOS 等）下的目录遍历：`rustix::fs` 的 Linux 专用接口
+/// 不可用，改用 `std::fs`；契约与 Linux 版本一致。
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-/// 非 Linux/Android（Windows、macOS 等）下的目录枚举：`rustix::fs` 的 Linux 专用接口不可用，改用 `std::fs`，行为与 Linux 版本一致。
-fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
-    let dir = resolve_under(root, path)?;
+fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
+    let read_dir = std::fs::read_dir(dir).ok()?;
 
-    let Ok(read_dir) = std::fs::read_dir(&dir) else {
-        return None;
-    };
-
-    let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
     for entry in read_dir {
         let Ok(entry) = entry else {
             continue;
         };
-        let entry_path = entry.path();
         // symlink_metadata 不跟随符号链接，与 Unix 版本 SYMLINK_NOFOLLOW 语义一致
-        let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
         let ft = metadata.file_type();
-        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目
+        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目。
+        // 判断放在分配名字之前，理由同上。
         if ft.is_symlink() {
             continue;
         }
-        let is_dir = ft.is_dir();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let size = if is_dir { None } else { Some(metadata.len()) };
         let modified = metadata
             .modified()
             .ok()
@@ -223,13 +222,40 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
 
-        list_entries.push(ListEntry {
-            name,
-            entry_type: if is_dir { "dir" } else { "file" },
-            size,
+        emit(RawEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: ft.is_dir(),
+            size: metadata.len(),
             modified,
         });
     }
+    Some(())
+}
+
+/// 枚举目录并返回排序后的条目；路径非法、非目录或打不开返回 `None`。
+///
+/// 平台差异全部收在 [`raw_dir_entries`] 这一条原语里，剩下的取舍（目录不带 size）
+/// 与排序两个平台共用同一份代码；原语按回调逐条交来，这里边收边填，不攒中间 `Vec`。
+///
+/// 闭包按值传：`impl FnMut` 收的就是所有权，按值传时参数类型能从 `FnMut(RawEntry)`
+/// 直接推出来；写成 `&mut |entry| …` 则要先过一层 `&mut Closure: FnMut` 的 impl，
+/// 闭包自身参数类型在这个位置推不出来（E0282）。两者单态化后机器码一致。
+///
+/// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
+fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
+    let dir = resolve_under(root, path)?;
+
+    let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
+    raw_dir_entries(&dir, |entry| {
+        let is_dir = entry.is_dir;
+        let size = if is_dir { None } else { Some(entry.size) };
+        list_entries.push(ListEntry {
+            name: entry.name,
+            entry_type: if is_dir { "dir" } else { "file" },
+            size,
+            modified: entry.modified,
+        });
+    })?;
 
     sort_list_entries(&mut list_entries);
 
