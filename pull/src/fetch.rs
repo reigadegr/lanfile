@@ -81,16 +81,16 @@ pub async fn list_entries(
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
-/// 一次抓取里正文（`BufReader` 预读之外的那部分）走的搬运方式。
+/// 一次抓取里正文走的搬运方式。
 ///
-/// 拉完给用户汇报「几个文件吃上了 `splice`」时就按它分类。
+/// 拉完给用户汇报「几个文件真的做了内核搬运、几个根本不用搬」时就按它分类。
 #[derive(Clone, Copy, Debug)]
 pub enum Via {
     /// 内核 `splice(2)` 零拷贝：socket → 管道 → 文件。
     Splice,
     /// 用户态 `read` + `write`：非 Linux/Android，或目标文件系统没有 `splice_write`。
     Copy,
-    /// 没有需要搬运的正文：全在 `BufReader` 的预读缓冲里（小文件都是这一支）。
+    /// 正文全在 `BufReader` 的预读缓冲里，没有需要搬运的字节。
     Prebuffered,
 }
 
@@ -189,20 +189,16 @@ fn copy_sync(
 ) -> Result<(u64, Via), Error> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut file = std::fs::File::create(target)?;
-    let mut total = 0_u64;
 
     // `BufReader` 预读出来的正文开头先落盘。对端若发多了（超过 `Content-Length`），
     // 多出的字节已经在 `BufReader` 里被吞掉，这里截到 `want` 就不会误当正文写下去。
     let take = buffered.len().min(want as usize);
     if take > 0 {
         file.write_all(&buffered[..take])?;
-        total = take as u64;
     }
 
-    let (copied, via) = copy_body(stream, &file, want - total)?;
-    total += copied;
-    file.flush()?;
-    Ok((total, via))
+    let (copied, via) = copy_body(stream, &file, want - take as u64)?;
+    Ok((take as u64 + copied, via))
 }
 
 /// 把剩下的正文搬进文件（接着当前文件偏移写），返回落盘字节数与搬运方式。
@@ -220,11 +216,8 @@ fn copy_body(
     }
     // 非 Linux/Android 没有 `splice(2)`，整段不编译，直接落到下面的用户态读写
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        match transfer(stream, file, want)? {
-            Moved::Done(copied) => return Ok((copied, Via::Splice)),
-            Moved::Unsupported => {}
-        }
+    if let Moved::Done(copied) = transfer(stream, file, want)? {
+        return Ok((copied, Via::Splice));
     }
     Ok((copy_read_write(stream, file, want)?, Via::Copy))
 }
@@ -301,12 +294,11 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use tokio::net::TcpStream;
 
     /// 把请求头读到空行即止（GET 无正文）；`BufReader` 把整段请求吃进缓冲，读完恰好干净。
     async fn read_request(reader: &mut BufReader<TcpStream>) {
-        use tokio::io::AsyncBufReadExt as _;
-
         let mut line = String::new();
         loop {
             line.clear();
@@ -334,7 +326,6 @@ mod tests {
     #[tokio::test]
     async fn fetch_file_times_out_on_a_silent_server() {
         use std::time::Duration;
-        use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -362,7 +353,6 @@ mod tests {
     #[tokio::test]
     async fn fetch_file_times_out_on_a_stalled_body() {
         use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -405,8 +395,6 @@ mod tests {
     /// 恰好把 `into_inner` 丢缓冲这个坑踩在路径上（正文 3 字节，一定落在 `BufReader` 的预读里）。
     #[tokio::test]
     async fn fetch_file_reuses_one_connection_across_files() {
-        use tokio::io::{AsyncWriteExt, BufReader};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -452,8 +440,6 @@ mod tests {
     /// 而且读满 `Content-Length` 即止——连接仍然干净得能接着拉第二个大文件。
     #[tokio::test]
     async fn fetch_file_moves_a_large_body_over_one_connection() {
-        use tokio::io::AsyncWriteExt;
-
         const LEN: usize = 200_000;
         let first: Vec<u8> = (0..LEN as u32)
             .map(|index| (index % 251) as u8 + 1)
