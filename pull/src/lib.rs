@@ -38,9 +38,9 @@ use std::path::{Path, PathBuf};
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
 /// 两种来源：
-/// - 裸 host（`http://h [remote] [local] [--flat]`）：`remote` 缺省即拉根；给了名字则先试
-///   目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉（对 `lanfile get http://h a.tgz`
-///   不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
+/// - 裸 host（`http://h <remote> [local] [--flat]`）：`remote` 必给——拉根被禁，会在连服务端前
+///   直接报错；给了名字则先试目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉（对
+///   `lanfile get http://h a.tgz` 不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
 /// - 直链（URL 的路径/fragment 已指明远端）：`http://h/files/<sub>`、`http://h/pull/<sub>` 当
 ///   文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>`、`http://h/#<sub>` 当目录，其余
 ///   非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、kind 交给 `/api/list` 探测；不给
@@ -48,8 +48,7 @@ use std::path::{Path, PathBuf};
 ///
 /// 落盘语义对齐 `scp -r`：默认拉目录时在 `local` 下套一层以远端目录名命名的子目录
 /// （`local/dir/`）；`--flat`/`-f` 不套层，目录内容直接落 `local`（恢复 8f8a234 前的默认）。
-/// 拉单个文件时直接落 `local/<basename>`，不套层。不给 `local` 时，命名远端/文件缺省
-/// 当前目录，拉根缺省 `lanfile-root`（避免把整棵 share 散落进当前目录）。
+/// 拉单个文件时直接落 `local/<basename>`，不套层。不给 `local` 时，命名远端/文件缺省当前目录。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
     let mut pool = Pool::default();

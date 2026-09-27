@@ -14,13 +14,13 @@ pub struct Parsed {
     pub base: String,
     /// 已剥 scheme 的 `host[:port]`，建连用。
     pub host: String,
-    /// 远端相对路径（已剥首尾斜杠）；拉根为空串。
+    /// 远端相对路径（已剥首尾斜杠）；解析时已拒绝拉根，故恒非空。
     pub remote: String,
     /// 已知 kind，还是得探测。
     pub kind: Kind,
     /// 本地落盘目录。
     pub local: PathBuf,
-    /// 不套 basename 一层：目录内容直接落进 `local`，根总是如此（无名字可套）。
+    /// 不套 basename 一层：目录内容直接落进 `local`（单文件本就不套层）。
     pub flat: bool,
 }
 
@@ -61,14 +61,14 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, Error> {
         let local = pos.get(1).map(PathBuf::from);
         (remote, Kind::Auto, local)
     };
-    // 不给 local：命名远端/文件缺省当前目录，拉根缺省 lanfile-root。
-    let local = local.unwrap_or_else(|| {
-        if remote.is_empty() {
-            PathBuf::from("lanfile-root")
-        } else {
-            PathBuf::from(".")
-        }
-    });
+    // 拉根（remote 为空）被禁：在连服务端前直接报错，避免误把整棵 share 拖下来。
+    if remote.is_empty() {
+        return Err(Error::Malformed(
+            "不允许拉取根目录（整棵 share）；请指定子目录或直链，如 `lanfile get <base> sub`",
+        ));
+    }
+    // 不给 local：命名远端/文件缺省当前目录。
+    let local = local.unwrap_or_else(|| PathBuf::from("."));
     Ok(Parsed {
         base: src.base,
         host: src.host,
@@ -166,8 +166,8 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
         return None;
     }
     // 其余非空路径本身就是远端，是文件还是目录留给 `/api/list` 探测。早先这里返回 `None`
-    // 退回裸 host，而裸 host 的 remote 缺省为空＝拉根，于是 `http://h/.pi` 这样最自然的
-    // 写法会默默把整棵 share 拖进 `lanfile-root`。
+    // 退回裸 host、remote 缺省为空＝拉根，于是 `http://h/.pi` 这样最自然的写法会默默
+    // 退成拉根（拉根现已禁、会直接报错，但把路径认成远端仍是正解，不能丢）。
     let sub = path.trim_matches('/');
     if sub.is_empty() {
         return None;
@@ -233,10 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_bare_host_root_defaults_local() {
-        let p = parse_args(&["http://h:1".into()]).unwrap();
-        assert_eq!(p.remote, "");
-        assert_eq!(p.local, PathBuf::from("lanfile-root"));
+    fn parse_args_bare_host_root_is_rejected() {
+        // 不给 remote、给 / 或空串，都算拉根，一律在连服务端前拒绝。
+        assert!(parse_args(&["http://h:1".into()]).is_err());
+        assert!(parse_args(&["http://h:1".into(), "/".into()]).is_err());
+        assert!(parse_args(&["http://h:1".into(), String::new()]).is_err());
     }
 
     #[test]
@@ -342,12 +343,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_flat_root() {
-        // 拉根 + --flat：flat 对根是 no-op。
-        let p = parse_args(&["http://h:1".into(), "--flat".into()]).unwrap();
-        assert_eq!(p.remote, "");
-        assert_eq!(p.local, PathBuf::from("lanfile-root"));
-        assert!(p.flat);
+    fn parse_args_flat_root_is_rejected() {
+        // 拉根被禁，--flat 也救不回来。
+        assert!(parse_args(&["http://h:1".into(), "--flat".into()]).is_err());
     }
 
     #[test]

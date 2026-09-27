@@ -58,10 +58,9 @@ lanfile get <base_url | 直链> [<remote_dir>] [local_dir] [--flat | -f]
 
 两种源：
 
-**裸 host** —— `lanfile get http://host [remote_dir] [local_dir] [--flat]`
+**裸 host** —— `lanfile get http://host <remote_dir> [local_dir] [--flat]`
 
-- `remote_dir` 缺省即根；`local_dir` 缺省时：根拉取落到 `./lanfile-root`，指定了 `remote_dir`
-  则落到当前目录。
+- `remote_dir` 必给：拉整棵根被禁，会在连服务端前直接报错；`local_dir` 缺省时落到当前目录。
 - 类型交给服务端探测：`/api/list` 返回 200 即目录、整棵镜像；404 则当文件、走 `/pull` 直落。
 
 **直链** —— `lanfile get <url> [local_dir] [--flat]`，看 URL 里的远端：
@@ -71,13 +70,11 @@ lanfile get <base_url | 直链> [<remote_dir>] [local_dir] [--flat | -f]
 - 其余非空路径（如 `http://host/.pi`）→ 这条路径就是远端本身，文件还是目录交给服务端探测。
 - 直链可省略 `local_dir`，默认当前目录。
 
-`--flat` / `-f`（必须是最后一个参数）：只去掉最外层 `basename` 那层目录嵌套。根拉取与单
-文件时是 no-op。
+`--flat` / `-f`（必须是最后一个参数）：只去掉最外层 `basename` 那层目录嵌套。单文件时是 no-op。
 
 例：
 
 ```
-lanfile get http://192.168.1.20:9000                      # 整棵镜像到 ./lanfile-root
 lanfile get http://192.168.1.20:9000 docs                 # 镜像 docs/ 到当前目录
 lanfile get http://192.168.1.20:9000 docs ~/dl            # 镜像 docs/ 到 ~/dl/docs
 lanfile get http://192.168.1.20:9000/files/a.tgz          # 单文件直落 ./a.tgz
@@ -92,6 +89,7 @@ lanfile get http://192.168.1.20:9000/api/zip/docs ~/dl    # 目录递归拉取
   会空等到读取超时）。
 - 连接超时 10 秒、两次读取之间空闲超时 30 秒；服务器接上却不说话时不会把客户端挂死。
 - `get` 不发 `User-Agent` / `Accept`、不跟重定向、只认 200、不做断点续传——只伺候自家服务端。
+- 不拉根：`remote_dir` 为空（或不给、或 `/`）时直接报错、不连服务端——避免误把整棵 share 拖下来。
 
 ## 构建
 

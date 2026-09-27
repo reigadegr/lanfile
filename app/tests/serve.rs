@@ -964,7 +964,7 @@ async fn get_dir_direct_link_pulls_the_tree() {
 
 /// 路径直链 `http://h/<sub>`（如 `/.pi`）：路径就是远端，只拉那棵子树。
 /// 回归用：早先无法识别的路径会静默退回裸 host、remote 缺省为空＝拉根，把整棵 share
-/// 拖进 `lanfile-root`；这里显式断言根没被碰。
+/// 拖下来（拉根现已禁、会直接报错，但路径认成远端仍是正解）；这里显式断言只拉了子树。
 #[tokio::test]
 async fn get_path_only_url_pulls_that_subtree_not_the_root() {
     let dir = TestDir::new();
@@ -996,6 +996,36 @@ async fn get_path_only_url_pulls_that_subtree_not_the_root() {
     );
     assert!(!dst.root().join("lanfile-root").exists());
     assert!(!dst.root().join("root-only.txt").exists());
+
+    server.abort();
+}
+
+/// 拉根被禁：`lanfile get http://h`（不给 remote）在连服务端前就报错，啥也不下载。
+#[tokio::test]
+async fn get_root_is_rejected() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("root-only.txt"), "root").unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let dst = TestDir::new();
+    // 不给 remote ＝ 拉根：必须在连服务端前报错，且不碰本地。
+    let error = lanfile_pull::run(&[format!("http://{addr}")])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("根目录"),
+        "应报“根目录”相关错误，实得: {error}"
+    );
+    assert_eq!(std::fs::read_dir(dst.root()).unwrap().count(), 0);
 
     server.abort();
 }
