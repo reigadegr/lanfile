@@ -1,8 +1,9 @@
-//! HTTP/1.1 keep-alive 传输层：一条可复用的 TCP 连接上跑 `GET`，读状态行与响应头，
+//! HTTP/1.1 keep-alive 传输层：在可复用的 TCP 连接上跑 `GET`，读状态行与响应头，
 //! 正文由调用方按 `Content-Length` 读完。连接池 [`Pool`] 收口借/还，
 //! [`http_get`] 收口"复用的连接被对端悄悄关掉时换新重试一次"。
 
 use crate::error::Error;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -18,20 +19,33 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 pub const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// 一条可复用的 HTTP/1.1 keep-alive 连接。顺序拉取只用一条：每请求省掉一次三次握手与慢启动。
+/// 取锁，中毒也照常返回：临界区里只有一次 `Vec` 增删，中毒后内部数据仍结构完整，
+/// 继续用是安全的——与 `main.rs`、`file_cache.rs` 的 `lock` 语义对齐。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 可复用的 HTTP/1.1 keep-alive 连接池。
 ///
-/// 正文按 `Content-Length` 精确读满后由调用方 [`Pool::release`] 归还，下一请求 [`Pool::acquire`]
-/// 直接拿来用；读取出错、读不满声明的长度、或响应不带 `Content-Length` 都不归还，连接随之关闭。
+/// 池里存空闲的连接：[`Pool::acquire`] 借一条、[`Pool::release`] 还一条。并发拉取时
+/// 每个任务各借一条，池空则新建；归还的连接被下一个 `acquire` 复用。同时在飞的连接数
+/// 由调用方用 `buffer_unordered(N)` 的 N 控制——池本身不做上限，`N` 就是这个上限。
 #[derive(Default)]
 pub struct Pool {
-    conn: Option<BufReader<TcpStream>>,
+    idle: Mutex<Vec<BufReader<TcpStream>>>,
 }
 
 impl Pool {
-    /// 借一条连接：池里有就拿来用，没有就新建。取走后池为空，读完正文再由调用方归还或丢弃。
-    async fn acquire(&mut self, host: &str) -> Result<BufReader<TcpStream>, Error> {
-        if let Some(conn) = self.conn.take() {
-            return Ok(conn);
+    /// 借一条连接：池里有空闲的就拿来用，没有就新建。返回 `(连接, 是否来自池)`——
+    /// [`http_get`] 靠第二个值判断失败时要不要重试一次。
+    async fn acquire(&self, host: &str) -> Result<(BufReader<TcpStream>, bool), Error> {
+        // 临界区只有一次 `Vec::pop`：同步锁足够，省掉异步 Mutex 的状态机开销。
+        // 先把 `pop` 的结果取出来、让临时 `MutexGuard` 在语句结束时释放，再判 `Some`；
+        // 写成 `if let Some(conn) = lock(&self.idle).pop()` 会让 guard 一直活到整个
+        // `if let` 表达式结束（clippy::significant_drop_in_scrutinee）。
+        let idle = lock(&self.idle).pop();
+        if let Some(conn) = idle {
+            return Ok((conn, true));
         }
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host))
             .await
@@ -41,12 +55,12 @@ impl Pool {
                 source,
             })?;
         let _ = stream.set_nodelay(true);
-        Ok(BufReader::new(stream))
+        Ok((BufReader::new(stream), false))
     }
 
     /// 归还：正文按 `Content-Length` 精确读满、连接干净时才调。
-    pub fn release(&mut self, conn: BufReader<TcpStream>) {
-        self.conn = Some(conn);
+    pub fn release(&self, conn: BufReader<TcpStream>) {
+        lock(&self.idle).push(conn);
     }
 }
 
@@ -57,13 +71,14 @@ impl Pool {
 /// 失败——这时换一条新连接重试一次，不让一个已死的池连接把整次拉取带走。只重试一次、且只在
 /// 确系复用时：新连接也失败就是真出错。超时不重试（服务端活着只是慢，不是连接死了）。
 pub async fn http_get(
-    pool: &mut Pool,
+    pool: &Pool,
     host: &str,
     path: &str,
 ) -> Result<(BufReader<TcpStream>, Option<u64>), Error> {
-    let mut reused = pool.conn.is_some();
+    // `retried` 而不是"循环几次"：明确表示最多重试一次，二次进入循环时不再重试
+    let mut retried = false;
     loop {
-        let mut reader = pool.acquire(host).await?;
+        let (mut reader, reused) = pool.acquire(host).await?;
         match request(&mut reader, host, path).await {
             Ok((200, content_length)) => return Ok((reader, content_length)),
             Ok((status, _)) => {
@@ -72,8 +87,9 @@ pub async fn http_get(
                     path: path.to_string(),
                 });
             }
-            Err(error) if reused && !matches!(error, Error::Timeout { .. }) => {
-                reused = false;
+            Err(error) if reused && !retried && !matches!(error, Error::Timeout { .. }) => {
+                // 池里拿到的连接坏了：换新连接重试一次，`reader` 在这里被丢弃
+                retried = true;
             }
             Err(error) => return Err(error),
         }

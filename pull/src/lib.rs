@@ -13,16 +13,19 @@
 //! - `/pull/<sub>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
 //!   也不编码拉取端用不到的 `ETag`、`Last-Modified` 与 `Content-Disposition`（见 `lanfile_assets`）。
 //!
-//! v1 顺序拉取：一个文件一个文件，但共用一条 keep-alive 连接——一棵目录树只握一次手，
-//! 省掉每个文件的三次握手与慢启动。正文严格按响应声明的 `Content-Length` 读满即停：长度
-//! 不再是事后校验，而是读取本身的停止条件，读满的连接干净、直接归还池子复用。响应必须带
-//! `Content-Length`（见 `NO_CONTENT_LENGTH`）：缺了当场报错，不猜长度、也不退化成读到
-//! EOF——keep-alive 下对端不会关连接，那只会在空等之后撞上读取超时。连接与单次读取都设了
-//! 空闲超时，服务器半路哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次请求会换
-//! 一条新连接重试一次。正文在 Linux/Android 且目标文件系统支持时走 `splice(2)` 零拷贝落盘，
-//! 其余平台或文件系统退回用户态读写，落盘内容与截断判定两边一致。结构上每个文件的抓取收口
-//! 在 [`fetch_file`]、目录枚举收口在 [`list_entries`]，未来要做有限并发时把它们解耦、对文件
-//! 任务套一层 `buffer_unordered` 即可，不必重写本模块。
+//! 并发拉取：同一层目录里的文件各起一个任务，用 `buffer_unordered(DOWNLOAD_CONCURRENCY)`
+//! 限制同时在飞的任务数。目录递归保持串行——树是流式处理的，先把目录攒起来再并发会
+//! 让整棵树的展开碎掉、内存上界也失控；同层文件并发已经能吃满客户端的多核。连接池
+//! [`Pool`] 内部有锁，每个任务各借一条连接，互不影响。
+//!
+//! 正文严格按响应声明的 `Content-Length` 读满即停：长度不再是事后校验，而是读取本身的停止
+//! 条件，读满的连接干净、直接归还池子复用。响应必须带 `Content-Length`
+//! （见 `NO_CONTENT_LENGTH`）：缺了当场报错，不猜长度、也不退化成读到 EOF——keep-alive 下
+//! 对端不会关连接，那只会在空等之后撞上读取超时。连接与单次读取都设了空闲超时，服务器半路
+//! 哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次请求会换一条新连接重试一次。
+//! 正文在 Linux/Android 且目标文件系统支持时走 `splice(2)` 零拷贝落盘，其余平台或文件系统
+//! 退回用户态读写，落盘内容与截断判定两边一致。结构上每个文件的抓取收口在 [`fetch_file`]、
+//! 目录枚举收口在 [`list_entries`]。
 
 mod args;
 mod error;
@@ -34,9 +37,17 @@ mod splice;
 pub use error::{BoxError, Error};
 
 use crate::args::{Kind, Parsed, parse_args};
-use crate::fetch::{RemoteEntry, Via, fetch_file, list_entries};
+use crate::fetch::{Fetched, RemoteEntry, Via, fetch_file, list_entries};
 use crate::http::Pool;
+use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
+
+/// 同层目录里同时在飞的文件任务数。
+///
+/// 客户端与服务端都在本机、服务端几乎不占 CPU 时，串行拉取被逐个文件的往返时延卡住；
+/// 8 路并发把等待重叠起来，同时不会让服务端的 `FileCache` 分片锁或客户端磁盘写成为瓶颈。
+/// 一个文件一个连接，pool 的容量由这个数自然定住。
+const DOWNLOAD_CONCURRENCY: usize = 8;
 
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
@@ -54,13 +65,13 @@ use std::path::{Path, PathBuf};
 /// 拉单个文件时直接落 `local/<basename>`，不套层。不给 `local` 时，命名远端/文件缺省当前目录。
 pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
-    let mut pool = Pool::default();
+    let pool = Pool::default();
     match p.kind {
         // 直链已指明 kind：文件直接拉、目录当目录拉。
-        Kind::File => run_file(&mut pool, &p).await,
-        Kind::Dir => run_dir(&mut pool, &p, false).await,
+        Kind::File => run_file(&pool, &p).await,
+        Kind::Dir => run_dir(&pool, &p, false).await,
         // 裸 host：先试目录，`/api/list` 404 再当文件。
-        Kind::Auto => run_dir(&mut pool, &p, true).await,
+        Kind::Auto => run_dir(&pool, &p, true).await,
     }
 }
 
@@ -69,6 +80,12 @@ struct Stats {
     files: u64,
     dirs: u64,
     bytes: u64,
+    /// 因为本地已有同名同尺寸文件而跳过的文件数。
+    ///
+    /// 单独记一档，是为了让"拉了多少"与"整棵树有多少"不再混在一个数里：
+    /// 输出里的 `files` 是走完整棵树看到的文件总数，而它减去 `skipped` 才是这一趟
+    /// 真正拉下来的数量。
+    skipped: u64,
     /// 正文搬运方式的文件计数，拉完汇报「几个吃上 `splice`」用。
     via: ViaCounts,
 }
@@ -129,7 +146,7 @@ fn to_not_found(error: Error, remote: &str) -> Error {
 }
 
 /// 当文件拉 `/pull/<remote>`；404 统一转成「远端不存在」（裸 host 探测到这一步即目录与文件都不是）。
-async fn run_file(pool: &mut Pool, p: &Parsed) -> Result<(), BoxError> {
+async fn run_file(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
     pull_file_run(pool, p)
         .await
         .map_err(|error| to_not_found(error, &p.remote).into())
@@ -138,7 +155,7 @@ async fn run_file(pool: &mut Pool, p: &Parsed) -> Result<(), BoxError> {
 /// 当目录拉 `/api/list/<remote>`；404 时按 `fallback_file` 决定下一步：
 /// - `true`（裸 host）：改走 `/pull` 试单个文件；
 /// - `false`（目录直链）：URL 已经说清楚是目录，直接报"远端不存在"。
-async fn run_dir(pool: &mut Pool, p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
+async fn run_dir(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
     match list_entries(pool, &p.host, &p.remote).await {
         Ok(entries) => pull_dir_run(pool, p, entries).await.map_err(Into::into),
         Err(Error::Http { status: 404, .. }) if fallback_file => run_file(pool, p).await,
@@ -147,25 +164,26 @@ async fn run_dir(pool: &mut Pool, p: &Parsed, fallback_file: bool) -> Result<(),
 }
 
 /// 拉目录到 `local`（默认在 `local` 下套一层远端目录名，对齐 `scp -r`；`--flat` 不套层）。
-async fn pull_dir_run(pool: &mut Pool, p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error> {
+async fn pull_dir_run(pool: &Pool, p: &Parsed, entries: Vec<RemoteEntry>) -> Result<(), Error> {
     let remote = &p.remote;
     let target = local_target(&p.local, remote, p.flat);
     tokio::fs::create_dir_all(&target).await?;
     let stats = pull_entries(pool, &p.host, remote, &target, entries).await?;
     eprintln!(
-        "lanfile get: {}/{remote} -> {}（{} 文件，{} 字节，{} 目录）",
+        "lanfile get: {}/{remote} -> {}（{} 文件，{} 字节，{} 目录，跳过已存在 {} 个）",
         p.base,
         target.display(),
         stats.files,
         stats.bytes,
-        stats.dirs
+        stats.dirs,
+        stats.skipped,
     );
     stats.via.report();
     Ok(())
 }
 
 /// 拉单个文件到 `local/<basename>`：不套层，落盘根目录按需建。
-async fn pull_file_run(pool: &mut Pool, p: &Parsed) -> Result<(), Error> {
+async fn pull_file_run(pool: &Pool, p: &Parsed) -> Result<(), Error> {
     let remote = &p.remote;
     let name = basename(remote).unwrap_or("download");
     let target = p.local.join(name);
@@ -210,23 +228,42 @@ fn basename(remote: &str) -> Option<&str> {
 }
 
 /// 递归拉取 `remote` 目录到 `local`：先取这层条目，再逐条落盘。
-async fn pull_dir(pool: &mut Pool, host: &str, remote: &str, local: &Path) -> Result<Stats, Error> {
+async fn pull_dir(pool: &Pool, host: &str, remote: &str, local: &Path) -> Result<Stats, Error> {
     let entries = list_entries(pool, host, remote).await?;
     pull_entries(pool, host, remote, local, entries).await
 }
 
-/// 把一层条目落到 `local`：目录递归，文件逐个抓。单文件失败只记一条警告并继续。
+/// 一个文件条目处理完后的结果，供并发结果汇总用。
 ///
-/// 与 [`list_entries`] 拆开是为了让顶层那一次列表请求的失败（404）能被 [`run_dir`] 捕获、
-/// 转成"远端不存在"，而不是在这里被当成"递归里某层目录没了"。
+/// 拆成三态而不是 `Option<Result<Fetched, Error>>`：跳过和失败是两件不同的事，
+/// 后者要打警告，前者要计入 `skipped`——硬塞进一个 `Option` 里还得再判一次。
+enum FileOutcome {
+    /// 本地已存在且尺寸一致：跳过，不拉。
+    Skipped,
+    /// 拉下来了。
+    Fetched(Fetched),
+    /// 拉失败：远端路径与错误。
+    Failed(String, Error),
+}
+
+/// 把一层条目落到 `local`：目录递归，文件并发抓（[`DOWNLOAD_CONCURRENCY`] 路）。
+///
+/// 文件先攒成 future 列表、由 `buffer_unordered` 并发驱动、在主线程汇总——同一个目录下
+/// 的文件互不依赖，串行只会让各自的往返时延白白累加。目录递归仍串行：整棵树是流式展开的，
+/// 并发目录会让一层攒下所有子树的 future，内存不再有上界。
+///
+/// 单文件失败只记一条警告并继续，与串行版本语义一致。
 async fn pull_entries(
-    pool: &mut Pool,
+    pool: &Pool,
     host: &str,
     remote: &str,
     local: &Path,
     entries: Vec<RemoteEntry>,
 ) -> Result<Stats, Error> {
     let mut stats = Stats::default();
+    let mut file_tasks = Vec::new();
+    let mut subdirs = Vec::new();
+
     for entry in entries {
         let remote_child = if remote.is_empty() {
             entry.name.clone()
@@ -237,26 +274,50 @@ async fn pull_entries(
         if entry.is_dir() {
             tokio::fs::create_dir_all(&local_child).await?;
             stats.dirs += 1;
-            // async 递归必须装箱，否则 future 尺寸无限
-            let sub = Box::pin(pull_dir(pool, host, &remote_child, &local_child)).await?;
-            stats.files += sub.files;
-            stats.dirs += sub.dirs;
-            stats.bytes += sub.bytes;
-            stats.via.merge(&sub.via);
+            subdirs.push((remote_child, local_child));
         } else {
-            let remote_size = entry.size;
-            if !skip_existing(&local_child, remote_size).await {
-                match fetch_file(pool, host, &remote_child, &local_child).await {
-                    Ok(fetched) => {
-                        stats.bytes += fetched.bytes;
-                        stats.via.record(fetched.via);
-                    }
-                    Err(error) => eprintln!("  跳过 {remote_child}：{error}"),
-                }
-            }
             stats.files += 1;
+            let remote_size = entry.size;
+            // `pool: &Pool` 与 `host: &str` 都是共享引用，每个 async 块各捕获一份；
+            // future 只在本函数内被驱动，所以引用不必 `'static`
+            file_tasks.push(async move {
+                if skip_existing(&local_child, remote_size).await {
+                    return FileOutcome::Skipped;
+                }
+                let result = fetch_file(pool, host, &remote_child, &local_child).await;
+                match result {
+                    Ok(fetched) => FileOutcome::Fetched(fetched),
+                    Err(error) => FileOutcome::Failed(remote_child, error),
+                }
+            });
         }
     }
+
+    let outcomes = stream::iter(file_tasks)
+        .buffer_unordered(DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for outcome in outcomes {
+        match outcome {
+            FileOutcome::Skipped => stats.skipped += 1,
+            FileOutcome::Fetched(fetched) => {
+                stats.bytes += fetched.bytes;
+                stats.via.record(fetched.via);
+            }
+            FileOutcome::Failed(name, error) => eprintln!("  跳过 {name}：{error}"),
+        }
+    }
+
+    for (remote_child, local_child) in subdirs {
+        // async 递归必须装箱，否则 future 尺寸无限
+        let sub = Box::pin(pull_dir(pool, host, &remote_child, &local_child)).await?;
+        stats.files += sub.files;
+        stats.dirs += sub.dirs;
+        stats.bytes += sub.bytes;
+        stats.skipped += sub.skipped;
+        stats.via.merge(&sub.via);
+    }
+
     Ok(stats)
 }
 

@@ -2,6 +2,10 @@
 //! [`crate::http`] 的 keep-alive 传输之上。正文按响应声明的 `Content-Length` 精确读满即止，
 //! 读满的连接归还池子复用；读不满即截断，连接丢弃。落盘在 Linux/Android 且目标文件系统
 //! 支持时走 `splice(2)` 零拷贝（见 `crate::splice`），否则退回用户态读写的同步搬运。
+//!
+//! 连接池可被多个任务并发借还（[`crate::http::Pool`] 内部有锁），所以
+//! [`fetch_file`]/[`list_entries`] 只要 `&Pool`：调用方用 `buffer_unordered` 起并发，
+//! 每个文件各借一条连接，互不影响。
 
 use crate::error::Error;
 use crate::http::{Pool, READ_TIMEOUT, http_get};
@@ -50,7 +54,7 @@ struct ListResponse {
 /// 取一层目录的条目：`GET /api/list[/<remote>]`。正文按 `Content-Length` 增量读满，连接干净
 /// 归还池子复用；读不满即截断，连接丢弃。
 pub async fn list_entries(
-    pool: &mut Pool,
+    pool: &Pool,
     host: &str,
     remote: &str,
 ) -> Result<Vec<RemoteEntry>, Error> {
@@ -109,7 +113,7 @@ pub struct Fetched {
 /// 或半路超时/IO 出错，都把没写完的文件删掉再报错——宁可什么都没有，也不留一个看着完整
 /// 其实残缺的文件。
 pub async fn fetch_file(
-    pool: &mut Pool,
+    pool: &Pool,
     host: &str,
     remote: &str,
     local: &Path,
@@ -342,8 +346,8 @@ mod tests {
 
         let target =
             std::env::temp_dir().join(format!("lanfile-pull-timeout-{}", std::process::id()));
-        let mut pool = Pool::default();
-        let error = fetch_file(&mut pool, &addr.to_string(), "x.bin", &target)
+        let pool = Pool::default();
+        let error = fetch_file(&pool, &addr.to_string(), "x.bin", &target)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Timeout { .. }), "{error}");
@@ -373,8 +377,8 @@ mod tests {
 
         let target =
             std::env::temp_dir().join(format!("lanfile-pull-stall-{}", std::process::id()));
-        let mut pool = Pool::default();
-        let error = fetch_file(&mut pool, &addr.to_string(), "x.bin", &target)
+        let pool = Pool::default();
+        let error = fetch_file(&pool, &addr.to_string(), "x.bin", &target)
             .await
             .unwrap_err();
         assert!(
@@ -421,11 +425,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("a.bin");
         let f2 = dir.join("b.bin");
-        let mut pool = Pool::default();
-        let first = fetch_file(&mut pool, &addr.to_string(), "a.bin", &f1)
+        let pool = Pool::default();
+        let first = fetch_file(&pool, &addr.to_string(), "a.bin", &f1)
             .await
             .unwrap();
-        let second = fetch_file(&mut pool, &addr.to_string(), "b.bin", &f2)
+        let second = fetch_file(&pool, &addr.to_string(), "b.bin", &f2)
             .await
             .unwrap();
         // 3 字节正文必然落在 `BufReader` 的预读里：既没走 splice 也没走用户态搬运
@@ -469,8 +473,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("big1.bin");
         let f2 = dir.join("big2.bin");
-        let mut pool = Pool::default();
-        let copied = fetch_file(&mut pool, &addr.to_string(), "big1.bin", &f1)
+        let pool = Pool::default();
+        let copied = fetch_file(&pool, &addr.to_string(), "big1.bin", &f1)
             .await
             .unwrap();
         assert_eq!(
@@ -482,7 +486,7 @@ mod tests {
             !matches!(copied.via, Via::Prebuffered),
             "预读缓冲之外的正文被算成了无需搬运"
         );
-        fetch_file(&mut pool, &addr.to_string(), "big2.bin", &f2)
+        fetch_file(&pool, &addr.to_string(), "big2.bin", &f2)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&f1).unwrap(), first);

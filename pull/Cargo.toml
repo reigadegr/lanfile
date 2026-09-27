@@ -10,6 +10,9 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memchr = { workspace = true }
+# `StreamExt::buffer_unordered`：同层文件的并发下载（见 `src/lib.rs` 的 `pull_entries`）。
+# `futures-lite` 没有这个组合子，`futures-util` 有；后者已经是 `namedfile` 的依赖。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { workspace = true, features = ["fs", "io-util", "net", "time"] }
 
 # `splice(2)` 只有 Linux/Android 有：正文走内核零拷贝搬进文件（见 `src/splice.rs`）
