@@ -12,6 +12,10 @@ serde_json = "1"
 memchr = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "net", "time"] }
 
+# `splice(2)` 只有 Linux/Android 有：正文走内核零拷贝搬进文件（见 `src/splice.rs`）
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { workspace = true, features = ["pipe", "std"] }
+
 [dev-dependencies]
 # 单元测试要自己起运行时（`#[tokio::test]`）来跑超时路径
 tokio = { workspace = true, features = ["macros", "rt"] }

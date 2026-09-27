@@ -944,6 +944,7 @@ name = "lanfile-pull"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "serde",
  "serde_json",
  "tokio",

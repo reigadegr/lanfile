@@ -1,6 +1,7 @@
 //! 拉取操作：单文件下载 [`fetch_file`] 与目录列举 [`list_entries`]，都建在
 //! [`crate::http`] 的 keep-alive 传输之上。正文按响应声明的 `Content-Length` 精确读满即止，
-//! 读满的连接归还池子复用；读不满即截断，连接丢弃。
+//! 读满的连接归还池子复用；读不满即截断，连接丢弃。落盘在 Linux/Android 且目标文件系统
+//! 支持时走 `splice(2)` 零拷贝（见 `crate::splice`），否则退回用户态读写的同步搬运。
 
 use crate::error::Error;
 use crate::http::{Pool, READ_TIMEOUT, http_get};
@@ -8,6 +9,9 @@ use serde::Deserialize;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt as _, BufReader};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::splice::{Moved, transfer};
 
 /// 每块搬运的字节数：一次同步 `read` + 一次同步 `write` 处理这么多，够摊薄系统调用。
 const COPY_BUF: usize = 64 * 1024;
@@ -126,7 +130,7 @@ pub async fn fetch_file(
 /// `write` 都要把缓冲搬到 blocking pool，异步 socket 每次 `read` 都要过一遍 reactor
 /// 并在 waker 上注册一次；大文件连续传输时这两笔每块固定开销会累加到明显可观的 CPU
 /// 占用。整个循环收进一个 blocking 线程后，一次文件传输只跨线程两次（进、出），其余
-/// 全是同步系统调用与一次 `recv`。
+/// 全是同步系统调用（`splice(2)` 或 `read`/`write`）。
 ///
 /// `buffered` 是 `BufReader` 预读出来、还没被消耗的正文开头；`into_inner` 会把它丢掉，
 /// 所以由调用方先取出来，这里负责先落盘再接着读。
@@ -139,9 +143,9 @@ async fn copy_in_blocking(
     tokio::task::spawn_blocking(move || {
         // `into_std` 只把 fd 转回 std，不改变阻塞模式；tokio 的 socket 是非阻塞的，
         // 要做同步读就得先切回阻塞。
-        let mut stream = stream.into_std()?;
+        let stream = stream.into_std()?;
         stream.set_nonblocking(false)?;
-        let copied = copy_sync(&mut stream, &buffered, &target, want)?;
+        let copied = copy_sync(&stream, &buffered, &target, want)?;
         // 交还前切回非阻塞，否则 `from_std` 之后 reactor 会在错误的前提上注册 fd。
         stream.set_nonblocking(true)?;
         Ok::<_, Error>((copied, stream))
@@ -153,10 +157,10 @@ async fn copy_in_blocking(
 /// 同步地把正文搬进文件：读满 `want` 字节即停，或用完 socket 上的数据即停。
 ///
 /// 读满是因为对端声明了 `Content-Length`，读多一个字节会把下一条响应的开头吃进缓冲；
-/// 读不满则由调用方按截断处理。每次 `read` 都套一个 `READ_TIMEOUT` 的空闲超时（由
-/// `set_read_timeout` 实现），服务器接上却半路哑掉时不会把阻塞线程挂住。
+/// 读不满则由调用方按截断处理。每次读取都套一个 `READ_TIMEOUT` 的空闲超时（由
+/// `set_read_timeout` 挂在 socket 上），服务器接上却半路哑掉时不会把阻塞线程挂住。
 fn copy_sync(
-    stream: &mut std::net::TcpStream,
+    stream: &std::net::TcpStream,
     buffered: &[u8],
     target: &Path,
     want: u64,
@@ -173,7 +177,43 @@ fn copy_sync(
         total = take as u64;
     }
 
+    total += copy_body(stream, &file, want - total)?;
+    file.flush()?;
+    Ok(total)
+}
+
+/// 把剩下的正文搬进文件（接着当前文件偏移写），返回落盘字节数。
+///
+/// 目标支持 `splice(2)` 时走内核零拷贝，否则退回用户态读写——两边都读到 `want` 字节即止、
+/// 都用同一个 socket 空闲超时，调用方看到的字节数与截断语义完全一致。
+fn copy_body(stream: &std::net::TcpStream, file: &std::fs::File, want: u64) -> Result<u64, Error> {
+    // 正文已经全在 `BufReader` 的预读里（小文件都是这一支）就没什么可搬的，别白建一根管道
+    if want == 0 {
+        return Ok(0);
+    }
+    // 非 Linux/Android 没有 `splice(2)`，整段不编译，直接落到下面的用户态读写
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match transfer(stream, file, want)? {
+            Moved::Done(copied) => return Ok(copied),
+            Moved::Unsupported => {}
+        }
+    }
+    copy_read_write(stream, file, want)
+}
+
+/// 用户态搬运：一次 `read` 加一次 `write` 处理 [`COPY_BUF`] 字节，读满 `want` 即停，或用完
+/// socket 上的数据即停（读不满由调用方按截断处理）。
+///
+/// `Read`/`Write` 是实现在 `&TcpStream`/`&File` 上的（`read`/`write` 要 `&mut self`），所以
+/// 两个入参的绑定取成可变，引用本身仍是共享的。
+fn copy_read_write(
+    mut stream: &std::net::TcpStream,
+    mut file: &std::fs::File,
+    want: u64,
+) -> Result<u64, Error> {
     let mut buf = vec![0_u8; COPY_BUF];
+    let mut total = 0_u64;
     while total < want {
         let room = (want - total).min(buf.len() as u64) as usize;
         let read = match stream.read(&mut buf[..room]) {
@@ -196,7 +236,6 @@ fn copy_sync(
         file.write_all(&buf[..read])?;
         total += read as u64;
     }
-    file.flush()?;
     Ok(total)
 }
 
@@ -235,6 +274,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use tokio::net::TcpStream;
+
+    /// 把请求头读到空行即止（GET 无正文）；`BufReader` 把整段请求吃进缓冲，读完恰好干净。
+    async fn read_request(reader: &mut BufReader<TcpStream>) {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+    }
 
     #[test]
     fn encode_path_keeps_unreserved_and_slash() {
@@ -274,6 +330,46 @@ mod tests {
         server.abort();
     }
 
+    /// 响应头说好了长度，正文只给半截就哑掉：读取阶段同样要按「读取正文超时」报出来，
+    /// 半截文件不能留下。Linux 上这条路径由 `splice` 的 `EAGAIN` 走到。
+    #[tokio::test]
+    async fn fetch_file_times_out_on_a_stalled_body() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 报 100 字节正文，只发 10 字节，然后既不补也不断开
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let _ = conn.read(&mut request).await;
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789")
+                .await
+                .unwrap();
+            conn.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let target =
+            std::env::temp_dir().join(format!("lanfile-pull-stall-{}", std::process::id()));
+        let mut pool = Pool::default();
+        let error = fetch_file(&mut pool, &addr.to_string(), "x.bin", &target)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Timeout {
+                    phase: "读取正文"
+                }
+            ),
+            "{error}"
+        );
+        assert!(!target.exists(), "超时后不该留半截文件");
+        server.abort();
+    }
+
     /// 两个文件走同一条 keep-alive 连接：服务端只 accept 一次，第二条请求复用第一条归还的连接。
     /// 正文按 `Content-Length` 精确读满即停，读多的一个字节会把下一条响应的开头吃掉——这条
     /// 测试盯住「读满即止」与「归还复用」两件事同时成立。
@@ -282,22 +378,7 @@ mod tests {
     /// 恰好把 `into_inner` 丢缓冲这个坑踩在路径上（正文 3 字节，一定落在 `BufReader` 的预读里）。
     #[tokio::test]
     async fn fetch_file_reuses_one_connection_across_files() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpStream;
-
-        // 把请求头读到空行即止（GET 无正文）；BufReader 把整段请求吃进缓冲，读完恰好干净
-        async fn read_request(reader: &mut BufReader<TcpStream>) {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).await.unwrap() == 0 {
-                    break;
-                }
-                if line.trim().is_empty() {
-                    break;
-                }
-            }
-        }
+        use tokio::io::{AsyncWriteExt, BufReader};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -331,6 +412,52 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&f1).unwrap(), b"aaa");
         assert_eq!(std::fs::read(&f2).unwrap(), b"bbb");
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大正文（远超 `BufReader` 的 8 KiB 预读）整段走内核 `splice` 通道：内容要一字节不差，
+    /// 而且读满 `Content-Length` 即止——连接仍然干净得能接着拉第二个大文件。
+    #[tokio::test]
+    async fn fetch_file_moves_a_large_body_over_one_connection() {
+        use tokio::io::AsyncWriteExt;
+
+        const LEN: usize = 200_000;
+        let first: Vec<u8> = (0..LEN as u32)
+            .map(|index| (index % 251) as u8 + 1)
+            .collect();
+        let second: Vec<u8> = (0..LEN as u32)
+            .map(|index| (index % 241) as u8 + 2)
+            .collect();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body1, body2) = (first.clone(), second.clone());
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(conn);
+            for body in [&body1, &body2] {
+                read_request(&mut reader).await;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                reader.get_mut().write_all(head.as_bytes()).await.unwrap();
+                reader.get_mut().write_all(body).await.unwrap();
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("lanfile-pull-large-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("big1.bin");
+        let f2 = dir.join("big2.bin");
+        let mut pool = Pool::default();
+        let copied = fetch_file(&mut pool, &addr.to_string(), "big1.bin", &f1)
+            .await
+            .unwrap();
+        assert_eq!(copied, LEN as u64, "落盘字节数与 Content-Length 不一致");
+        fetch_file(&mut pool, &addr.to_string(), "big2.bin", &f2)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&f1).unwrap(), first);
+        assert_eq!(std::fs::read(&f2).unwrap(), second);
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -19,14 +19,17 @@
 //! `Content-Length`（见 `NO_CONTENT_LENGTH`）：缺了当场报错，不猜长度、也不退化成读到
 //! EOF——keep-alive 下对端不会关连接，那只会在空等之后撞上读取超时。连接与单次读取都设了
 //! 空闲超时，服务器半路哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次请求会换
-//! 一条新连接重试一次。结构上每个文件的抓取收口在 [`fetch_file`]、目录枚举收口在
-//! [`list_entries`]，未来要做有限并发时把它们解耦、对文件任务套一层 `buffer_unordered`
-//! 即可，不必重写本模块。
+//! 一条新连接重试一次。正文在 Linux/Android 且目标文件系统支持时走 `splice(2)` 零拷贝落盘，
+//! 其余平台或文件系统退回用户态读写，落盘内容与截断判定两边一致。结构上每个文件的抓取收口
+//! 在 [`fetch_file`]、目录枚举收口在 [`list_entries`]，未来要做有限并发时把它们解耦、对文件
+//! 任务套一层 `buffer_unordered` 即可，不必重写本模块。
 
 mod args;
 mod error;
 mod fetch;
 mod http;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod splice;
 
 pub use error::{BoxError, Error};
 
