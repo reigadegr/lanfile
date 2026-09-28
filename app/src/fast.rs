@@ -1,4 +1,4 @@
-//! `/files` 与 `/pull` 的 hyper 快路径。
+//! `/files`、`/pull`、`/stream` 的 hyper 快路径。
 //!
 //! salvo 的 `HyperHandler` 每请求要做一整套：按 `Host` 重建 `Uri`、往 `Extensions` 里插
 //! `ConnCtrl`、把路径 `to_owned`、构造 `PathState`、跑一遍路由匹配、重建 handler 链
@@ -10,8 +10,22 @@
 //! [`ServeFiles::serve`]、`/pull/*` 调用不缓存的 [`ServeFiles::serve_raw`]（都不经过
 //! `dyn Handler`，不装箱），其余路径原样交给 salvo 的 `HyperHandler`。HTTP/1 的配置直接
 //! 用 salvo 的 [`HttpBuilder::new`]——`Server::new` 用的就是它，所以连接层行为与原来完全一致。
+//!
+//! `/stream` 走得更远：accept 后先 `peek` 一眼请求行，命中就完全绕开 hyper，
+//! 直接往 socket 写响应头、遍历目录、逐文件 `sendfile(2)`。
+//! HTTP/1.1 下这是吃上 `sendfile` 的唯一方式：只要经过 hyper 的 body，
+//! 无 `Content-Length` 就会走 chunked 分帧，零拷贝无从谈起。
 
-use std::{borrow::Cow, future::Future, io, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    borrow::Cow,
+    future::Future,
+    io::{self, Read as _},
+    net::TcpStream as StdTcpStream,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use lanfile_assets::ServeFiles;
 use lanfile_sendfile::{SendfileSlot, SendfileStream};
@@ -162,6 +176,87 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
 /// accept 出错后的退避时间，取值与 salvo 的 `Server` 一致。
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// 看一眼请求行是不是 `/stream/...`。
+///
+/// 用 `peek` 不消耗 socket 缓冲；是就交给自定义处理，否则原样交回给 hyper。
+/// 带超时，避免客户端连上却不发请求时卡住 accept 循环。
+async fn peek_is_stream(conn: &tokio::net::TcpStream) -> bool {
+    let mut buf = [0_u8; 1024];
+    let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), conn.peek(&mut buf)).await
+    else {
+        return false;
+    };
+    let Some(line_end) = buf[..n].windows(2).position(|w| w == b"\r\n") else {
+        return false;
+    };
+    let line = &buf[..line_end];
+    // GET /stream/... HTTP/1.1
+    let Some(space1) = line.iter().position(|&b| b == b' ') else {
+        return false;
+    };
+    let rest = &line[space1 + 1..];
+    let Some(space2) = rest.iter().position(|&b| b == b' ') else {
+        return false;
+    };
+    rest[..space2].starts_with(b"/stream/")
+}
+
+/// 处理一条 `/stream/` 连接：读请求头、解析路径、交给阻塞线程跑同步 sendfile 流程。
+async fn handle_stream_connection(
+    conn: tokio::net::TcpStream,
+    root: Arc<PathBuf>,
+) -> io::Result<()> {
+    let _ = conn.set_nodelay(true);
+    let stream = conn.into_std()?;
+    tokio::task::spawn_blocking(move || handle_stream_blocking(stream, &root))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
+    // 读请求头，到空行为止
+    let mut head = Vec::with_capacity(1024);
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            return Ok(()); // 客户端没发完整请求就挂了
+        }
+        head.push(byte[0]);
+        if head.len() > 16_384 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "请求头过长"));
+        }
+    }
+
+    // 解析请求行，取路径
+    let Some(line_end) = head.windows(2).position(|w| w == b"\r\n") else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行未终止"));
+    };
+    let line = &head[..line_end];
+    let Some(space1) = line.iter().position(|&b| b == b' ') else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行格式异常"));
+    };
+    let rest = &line[space1 + 1..];
+    let Some(space2) = rest.iter().position(|&b| b == b' ') else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行格式异常"));
+    };
+    let path = std::str::from_utf8(&rest[..space2])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "请求路径不是 UTF-8"))?;
+    let Some(encoded_sub) = path.strip_prefix("/stream/") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "路径不以 /stream/ 开头",
+        ));
+    };
+
+    let decoded = decode_url_path(encoded_sub);
+    lanfile_list::serve_stream(&mut stream, root, &decoded)
+}
+
 /// 跑 accept 循环，把每条连接交给 [`FastService`]。
 ///
 /// 取代原来的 `Server::new(acceptor).serve(router)`。连接本身仍按 sendfile 的要求包装
@@ -175,7 +270,8 @@ pub async fn serve(
 ) -> io::Result<()> {
     let builder = Arc::new(HttpBuilder::new());
     let service = Service::new(router);
-    let files = Arc::new(ServeFiles::new(root));
+    let files = Arc::new(ServeFiles::new(root.clone()));
+    let root = Arc::new(root);
     loop {
         let (conn, remote_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -203,6 +299,18 @@ pub async fn serve(
             // 丢的只是这条连接的延迟优化：Nagle 设不上不影响正确性，连接照样服务
             tracing::debug!(error = ?error, "设置 TCP_NODELAY 失败");
         }
+
+        // /stream 分流：peek 一眼请求行，命中就完全绕开 hyper
+        if peek_is_stream(&conn).await {
+            let root = Arc::clone(&root);
+            tokio::spawn(async move {
+                if let Err(error) = handle_stream_connection(conn, root).await {
+                    tracing::debug!("stream 连接出错: {error}");
+                }
+            });
+            continue;
+        }
+
         let slot = Arc::new(SendfileSlot::new());
         let stream = SendfileStream::new(conn, Arc::clone(&slot));
         // 一条连接只建一份 `ConnCtrl`，与 salvo 的 `TcpAcceptor` 一样：`HyperHandler` 会把它
@@ -260,6 +368,7 @@ mod tests {
         assert!(route_path("/files").is_none());
         assert!(route_path("/pull").is_none());
         assert!(route_path("/api/list").is_none());
+        assert!(route_path("/stream/foo").is_none()); // stream 走 peek 分流，不进 hyper
         assert!(route_path("/static/x.css").is_none());
         assert!(route_path("/").is_none());
     }

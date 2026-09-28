@@ -1,7 +1,4 @@
-use std::{
-    fmt::Write as _,
-    path::{Path, PathBuf},
-};
+use std::{fmt::Write as _, fs::File, path::Path};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::mem::MaybeUninit;
@@ -11,8 +8,18 @@ use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
 pub enum Entry {
-    File { abs: PathBuf, name: String },
-    Dir { name: String },
+    File {
+        /// 已用 `openat(dirfd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW)` 打开。
+        /// 相对父目录解析，省掉全路径逐层查找。
+        file: File,
+        /// 文件字节数（来自 `fstat`）。
+        size: u64,
+        /// zip 内路径（含 prefix）。
+        name: String,
+    },
+    Dir {
+        name: String,
+    },
 }
 
 /// 取目录名作为 zip 内根前缀（也用于 Content-Disposition 文件名）。
@@ -86,10 +93,25 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         let keep_going = if actual_ft.is_dir() {
             walk_inner(&path, &zip_name, on_entry)
         } else if actual_ft.is_file() {
-            on_entry(Entry::File {
-                abs: path,
-                name: zip_name,
-            })
+            // 相对 dirfd 打开：一个组件的路径解析，省掉从 `/` 开始的逐层查找。
+            // 失败就跳过这个文件，不中断整棵树。
+            let opened = rfs::openat(
+                &dirfd,
+                &name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .ok()
+            .and_then(|fd| rfs::fstat(&fd).ok().map(|stat| (fd, stat)));
+            match opened {
+                Some((fd, stat)) => on_entry(Entry::File {
+                    file: fd.into(),
+                    #[allow(clippy::cast_sign_loss)]
+                    size: stat.st_size as u64,
+                    name: zip_name,
+                }),
+                None => true,
+            }
         } else {
             // 符号链接等其它类型：跳过
             true
@@ -134,10 +156,14 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         let keep_going = if ft.is_dir() {
             walk_inner(&path, &zip_name, on_entry)
         } else if ft.is_file() {
-            on_entry(Entry::File {
-                abs: path,
-                name: zip_name,
-            })
+            match File::open(&path) {
+                Ok(file) => on_entry(Entry::File {
+                    file,
+                    size: metadata.len(),
+                    name: zip_name,
+                }),
+                Err(_) => true,
+            }
         } else {
             // 符号链接等其它类型：跳过
             true
@@ -166,11 +192,11 @@ pub fn content_disposition(folder_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
-    fn tmp_root(tag: &str) -> PathBuf {
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("lanfile-zip-{tag}-{}", std::process::id()))
     }
 
@@ -207,9 +233,11 @@ mod tests {
         for e in &out {
             match e {
                 Entry::Dir { name } => assert!(name.ends_with('/'), "目录条目应以 / 结尾: {name}"),
-                Entry::File { abs, name } => {
+                Entry::File { file, name, .. } => {
                     assert!(name.starts_with("root/"), "文件 zip 路径应带前缀: {name}");
-                    assert!(abs.exists(), "文件应存在于磁盘: {abs:?}");
+                    // fd 仍然可读，说明 openat 拿到的就是文件本身
+                    let meta = file.metadata().expect("fd 应当有元数据");
+                    assert!(meta.is_file());
                 }
             }
         }

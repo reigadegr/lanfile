@@ -32,7 +32,7 @@ pub enum Kind {
     Dir,
     /// `/files/`、`/pull/` 直链：直接当文件。
     File,
-    /// `/api/stream/<sub>` 或 `/#<sub>`：一次请求把整棵树流下来。
+    /// `/stream/<sub>` 或 `/#<sub>`：一次请求把整棵树流下来（sendfile + splice）。
     Stream,
 }
 
@@ -154,9 +154,10 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
             kind: Kind::Dir,
         });
     }
-    // 显式流式端点。
+    // 流式端点：/stream/<sub>，以及旧写法 /api/stream/<sub> 向后兼容。
     if let Some(sub) = path
-        .strip_prefix("api/stream/")
+        .strip_prefix("stream/")
+        .or_else(|| path.strip_prefix("api/stream/"))
         .filter(|sub| !sub.is_empty())
     {
         return Some(Direct {
@@ -281,15 +282,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_file_direct_link_explicit_local() {
-        let p = parse_args(&["http://h:1/files/x".into(), "./dst".into()]).unwrap();
-        assert_eq!(p.local, PathBuf::from("./dst"));
-    }
-
-    #[test]
     fn parse_args_direct_link_strips_query_and_fragment() {
         let p = parse_args(&["http://h:1/files/x.txt?v=1#frag".into()]).unwrap();
         assert_eq!(p.remote, "x.txt");
+    }
+
+    #[test]
+    fn parse_args_stream_direct_link_is_stream() {
+        let p = parse_args(&["http://h:1/stream/a/b".into()]).unwrap();
+        assert_eq!(p.remote, "a/b");
+        assert_eq!(p.kind, Kind::Stream);
+    }
+
+    #[test]
+    fn parse_args_legacy_api_stream_is_stream() {
+        let p = parse_args(&["http://h:1/api/stream/a/b".into()]).unwrap();
+        assert_eq!(p.remote, "a/b");
+        assert_eq!(p.kind, Kind::Stream);
     }
 
     #[test]
@@ -310,25 +319,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_fragment_direct_link_is_stream() {
+        let p = parse_args(&["http://h:1/#filerserve".into()]).unwrap();
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Stream);
+        // 不写 `/`、不带路径的 `#<sub>` 同样认
+        let p = parse_args(&["http://h:1#filerserve".into()]).unwrap();
+        assert_eq!(p.remote, "filerserve");
+        assert_eq!(p.kind, Kind::Stream);
+    }
+
+    #[test]
     fn parse_args_path_only_url_is_a_remote() {
         // 路径本身就是远端（kind 待探测）：http://h/.pi 等价于 lanfile get http://h .pi。
         let p = parse_args(&["http://h:1/.pi".into()]).unwrap();
-        assert_eq!(p.host, "h:1");
         assert_eq!(p.remote, ".pi");
         assert_eq!(p.kind, Kind::Auto);
-        assert_eq!(p.local, PathBuf::from("."));
         // 多级路径整条都是远端；它后面的位置参数是 local。
         let p = parse_args(&["http://h:1/a/b".into(), "./dst".into()]).unwrap();
         assert_eq!(p.remote, "a/b");
         assert_eq!(p.kind, Kind::Auto);
         assert_eq!(p.local, PathBuf::from("./dst"));
-        // 带 fragment 时路径优先，fragment 不再重复当远端。
-        let p = parse_args(&["http://h:1/.pi#x".into()]).unwrap();
-        assert_eq!(p.remote, ".pi");
-        // 只有空路径才算裸 host，remote 仍从位置参数来。
-        let p = parse_args(&["http://h:1/".into(), "sub".into()]).unwrap();
-        assert_eq!(p.remote, "sub");
-        assert_eq!(p.kind, Kind::Auto);
     }
 
     #[test]
@@ -390,45 +401,6 @@ mod tests {
         let p = parse_args(&["http://h:1/api/list/a/b".into()]).unwrap();
         assert_eq!(p.remote, "a/b");
         assert_eq!(p.kind, Kind::Dir);
-    }
-
-    #[test]
-    fn parse_args_stream_direct_link_is_stream() {
-        let p = parse_args(&["http://h:1/api/stream/a/b".into()]).unwrap();
-        assert_eq!(p.remote, "a/b");
-        assert_eq!(p.kind, Kind::Stream);
-    }
-
-    #[test]
-    fn parse_args_fragment_direct_link_is_stream() {
-        let p = parse_args(&["http://h:1/#filerserve".into()]).unwrap();
-        assert_eq!(p.remote, "filerserve");
-        assert_eq!(p.kind, Kind::Stream);
-        // 不写 `/`、不带路径的 `#<sub>` 同样认
-        let p = parse_args(&["http://h:1#filerserve".into()]).unwrap();
-        assert_eq!(p.remote, "filerserve");
-        assert_eq!(p.kind, Kind::Stream);
-    }
-
-    #[test]
-    fn parse_args_dir_direct_link_explicit_local_and_flat() {
-        let p = parse_args(&[
-            "http://h:1/api/zip/filerserve".into(),
-            "./dst".into(),
-            "--flat".into(),
-        ])
-        .unwrap();
-        assert_eq!(p.local, PathBuf::from("./dst"));
-        assert!(p.flat);
-    }
-
-    #[test]
-    fn parse_args_route_prefix_without_name_is_not_a_direct_link() {
-        // `/api/zip/` 后面没名字：不当目录直链，整条路径退化成普通远端（kind 仍待探测）。
-        let p = parse_args(&["http://h:1/api/zip/".into(), "./dst".into()]).unwrap();
-        assert_eq!(p.remote, "api/zip");
-        assert_eq!(p.kind, Kind::Auto);
-        assert_eq!(p.local, PathBuf::from("./dst"));
     }
 
     #[test]

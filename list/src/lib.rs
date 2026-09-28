@@ -1,6 +1,8 @@
 use std::{
-    io::Read as _,
-    path::PathBuf,
+    fs::File,
+    io::{Read as _, Write as _},
+    net::TcpStream,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,7 +14,7 @@ use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir};
+use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 use salvo::{
     http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue},
     prelude::*,
@@ -88,7 +90,7 @@ impl ListApi {
 }
 
 /// 解析请求路径对应的绝对目录，且必须位于 root 之内（防目录穿越）。
-fn resolve_under(root: &std::path::Path, sub: &str) -> Option<PathBuf> {
+fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
     let canonical = root.join(sub).canonicalize().ok()?;
     canonical.starts_with(root).then_some(canonical)
 }
@@ -129,11 +131,11 @@ struct RawEntry {
 /// 每个目录多一次堆分配；回调也让名字的 `String` 从原语直接移进调用方的 `Vec`，
 /// 中间没有第二次搬运。闭包会被单态化，机器码与手写展开一致。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
+fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
     // 1. openat 打开目录 fd
     //    OFlags::DIRECTORY 隐含 is_dir 检查，省 1 次 stat
-    let dirfd = fs::openat(
-        fs::CWD,
+    let dirfd = rfs::openat(
+        rfs::CWD,
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
@@ -148,7 +150,6 @@ fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Opt
         let Ok(entry) = entry else {
             continue;
         };
-
         // 3. 名字按原始字节读取，后续 statat 与 String 分配复用
         let name_cstr = entry.file_name();
         let name_bytes = name_cstr.to_bytes();
@@ -156,14 +157,12 @@ fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Opt
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-
         // 4. statat 相对 dirfd 获取 size + mtime
         //    SYMLINK_NOFOLLOW 不跟随符号链接（比 std metadata() 更安全）
         //    相对路径解析比绝对路径更快
-        let Ok(stat) = fs::statat(&dirfd, name_cstr, AtFlags::SYMLINK_NOFOLLOW) else {
+        let Ok(stat) = rfs::statat(&dirfd, name_cstr, AtFlags::SYMLINK_NOFOLLOW) else {
             continue;
         };
-
         // 5. d_type 判断类型（零 syscall，来自 dirent）；Unknown 时回退到 stat 的 st_mode
         let ft = entry.file_type();
         let actual_ft = if ft == FileType::Unknown {
@@ -171,18 +170,15 @@ fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Opt
         } else {
             ft
         };
-
         // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目。
         // 判断放在分配名字之前，符号链接多时不必为注定丢弃的条目付一次 String。
         if actual_ft.is_symlink() {
             continue;
         }
-
         // 6. 直接读 st_mtime（跳过 SystemTime → Duration → as_secs 转换链）
         let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0)
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
-
         emit(RawEntry {
             // 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
             name: String::from_utf8_lossy(name_bytes).into_owned(),
@@ -198,9 +194,8 @@ fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Opt
 /// 非 Linux/Android（Windows、macOS 等）下的目录遍历：`rustix::fs` 的 Linux 专用接口
 /// 不可用，改用 `std::fs`；契约与 Linux 版本一致。
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
+fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
     let read_dir = std::fs::read_dir(dir).ok()?;
-
     for entry in read_dir {
         let Ok(entry) = entry else {
             continue;
@@ -221,7 +216,6 @@ fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Opt
             .map(chrono::DateTime::<chrono::Utc>::from)
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
-
         emit(RawEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: ft.is_dir(),
@@ -242,9 +236,8 @@ fn raw_dir_entries(dir: &std::path::Path, mut emit: impl FnMut(RawEntry)) -> Opt
 /// 闭包自身参数类型在这个位置推不出来（E0282）。两者单态化后机器码一致。
 ///
 /// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
-fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> {
+fn list_directory(root: &Path, path: &str) -> Option<Vec<ListEntry>> {
     let dir = resolve_under(root, path)?;
-
     let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
     raw_dir_entries(&dir, |entry| {
         let is_dir = entry.is_dir;
@@ -256,9 +249,7 @@ fn list_directory(root: &std::path::Path, path: &str) -> Option<Vec<ListEntry>> 
             modified: entry.modified,
         });
     })?;
-
     sort_list_entries(&mut list_entries);
-
     Some(list_entries)
 }
 
@@ -288,10 +279,11 @@ impl ListApi {
             port: self.port,
             entries,
         };
-
         res.render(Json(response));
     }
 }
+
+// ---- zip 打包流水线 ----
 
 /// zip 打包流水线里，阻塞遍历线程发往异步写线程的一条消息。
 ///
@@ -388,7 +380,9 @@ impl ZipApi {
         tokio::task::spawn_blocking(move || {
             zip::walk(&canonical, &folder_name, &mut |entry| match entry {
                 zip::Entry::Dir { name } => item_tx.blocking_send(Item::Dir { name }).is_ok(),
-                zip::Entry::File { abs, name } => send_one_file(&item_tx, &mut free_rx, &abs, name),
+                zip::Entry::File { file, size, name } => {
+                    send_one_file(&item_tx, &mut free_rx, file, size, name)
+                }
             });
         });
 
@@ -446,182 +440,118 @@ impl ZipApi {
     }
 }
 
-// ---- /api/stream：一次 HTTP 请求把整棵子树流成紧凑格式，客户端边收边落盘 ----
+// ---- /stream：走快路径的整树流式端点，正文 sendfile(2) ----
 
-/// 流里的一个条目：目录、文件头、或一块文件内容。
-enum StreamItem {
-    Dir { path: String },
-    FileStart { path: String, size: u64 },
-    Chunk { data: Vec<u8>, len: usize },
-}
-
-/// 协议标记：每个条目前 1 字节类型，路径以 NUL 结尾，文件随后跟 8 字节小端长度。
-/// 正文紧跟 `FileStart` 之后，恰好 `size` 字节。
+/// 协议标记：目录 0 / 文件 1，路径以 NUL 结尾，文件随后跟 8 字节小端长度 + 正文。
 const STREAM_DIR: u8 = 0;
 const STREAM_FILE: u8 = 1;
-const STREAM_EOF: u8 = 2;
 
-struct StreamApi {
-    root: PathBuf,
-}
+/// 服务 `/stream/<sub>`：把整棵子树流成紧凑格式，文件正文用 `sendfile(2)` 零拷贝。
+///
+/// 调用方（`app/src/fast.rs` 的 accept 分流）已经读过请求行、解析出路径；本函数
+/// 负责写响应头、遍历、逐条发送。响应不带 `Content-Length`，靠 `Connection: close`
+/// 后的 EOF 结束。
+///
+/// 回调只返回 `bool`（是否继续遍历），因此把会返回 `Err` 的部分收进一个内部闭包，
+/// 由外层把 `Err` 记进 `error` 并停表。
+pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::Result<()> {
+    let target = resolve_under(root, sub).filter(|p| p.is_dir());
+    let Some(target) = target else {
+        socket.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    };
 
-impl StreamApi {
-    #[must_use]
-    const fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-}
+    socket.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+    )?;
 
-#[handler]
-impl StreamApi {
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        let path = req.param::<String>("path").unwrap_or_default();
-        let root = self.root.clone();
-
-        let resolved = tokio::task::spawn_blocking(move || {
-            let canonical = resolve_under(&root, &path)?;
-            canonical.is_dir().then_some(canonical)
-        })
-        .await;
-
-        let Ok(resolved) = resolved else {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
-        };
-        let Some(canonical) = resolved else {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        };
-
-        res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-
-        // 与 ZipApi 同一套流水线：阻塞遍历线程 → 有界 channel → 异步写。
-        let (item_tx, mut item_rx) = tokio::sync::mpsc::channel::<StreamItem>(ZIP_QUEUE);
-        let (free_tx, mut free_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ZIP_QUEUE);
-
-        tokio::task::spawn_blocking(move || {
-            zip::walk(&canonical, "", &mut |entry| match entry {
+    // 遍历时只有 `bool` 可用，把 IO 结果收在 `error` 上；回调每次开头检查它，
+    // 一旦出错就立刻返回 `false` 停下遍历。
+    let mut error: Option<std::io::Error> = None;
+    zip::walk(&target, "", &mut |entry| {
+        if error.is_some() {
+            return false;
+        }
+        // 内层闭包返回 `Result`，`?` 就能用了
+        let result: std::io::Result<()> = (|| {
+            match entry {
                 zip::Entry::Dir { name } => {
                     // walk 给的 name 形如 `/sub/`；剥掉首尾斜杠即相对路径，根目录条目为空跳过
-                    let dir = name.trim_start_matches('/').trim_end_matches('/');
-                    if dir.is_empty() {
-                        return true;
+                    let rel = name.trim_start_matches('/').trim_end_matches('/');
+                    if rel.is_empty() {
+                        // 根目录条目自身不发出
+                        return Ok(());
                     }
-                    item_tx
-                        .blocking_send(StreamItem::Dir {
-                            path: dir.to_string(),
-                        })
-                        .is_ok()
+                    socket.write_all(&[STREAM_DIR])?;
+                    socket.write_all(rel.as_bytes())?;
+                    socket.write_all(&[0])?;
                 }
-                zip::Entry::File { abs, name } => {
-                    let rel = name.trim_start_matches('/').to_string();
-                    send_stream_file(&item_tx, &mut free_rx, &abs, rel)
-                }
-            });
-        });
-
-        let tx = res.channel();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt as _;
-            let mut writer = tokio::io::BufWriter::with_capacity(ZIP_FLUSH, tx);
-            while let Some(item) = item_rx.recv().await {
-                let result: std::io::Result<()> = async {
-                    match item {
-                        StreamItem::Dir { path } => {
-                            writer.write_all(&[STREAM_DIR]).await?;
-                            writer.write_all(path.as_bytes()).await?;
-                            writer.write_all(&[0]).await?;
-                        }
-                        StreamItem::FileStart { path, size } => {
-                            writer.write_all(&[STREAM_FILE]).await?;
-                            writer.write_all(path.as_bytes()).await?;
-                            writer.write_all(&[0]).await?;
-                            writer.write_all(&size.to_le_bytes()).await?;
-                        }
-                        StreamItem::Chunk { data, len } => {
-                            writer.write_all(&data[..len]).await?;
-                            // 池满就丢弃，只是少一次复用，不影响正确性
-                            let _ = free_tx.try_send(data);
-                        }
-                    }
-                    Ok(())
-                }
-                .await;
-                if result.is_err() {
-                    return;
+                zip::Entry::File { file, size, name } => {
+                    let rel = name.trim_start_matches('/');
+                    socket.write_all(&[STREAM_FILE])?;
+                    socket.write_all(rel.as_bytes())?;
+                    socket.write_all(&[0])?;
+                    socket.write_all(&size.to_le_bytes())?;
+                    sendfile_all(socket, &file, size)?;
                 }
             }
-            let _ = writer.write_all(&[STREAM_EOF]).await;
-            let _ = writer.flush().await;
-        });
-    }
-}
-
-/// 发一个文件：先发头（相对路径 + 长度），再分块发内容。返回是否应继续遍历。
-fn send_stream_file(
-    tx: &tokio::sync::mpsc::Sender<StreamItem>,
-    free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-    abs: &std::path::Path,
-    name: String,
-) -> bool {
-    let Ok(mut f) = std::fs::File::open(abs) else {
-        return true; // 打不开的文件跳过，不中断整棵树
-    };
-    let Ok(meta) = f.metadata() else {
-        return true;
-    };
-    let size = meta.len();
-
-    if tx
-        .blocking_send(StreamItem::FileStart { path: name, size })
-        .is_err()
-    {
-        return false;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
-
-    loop {
-        let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0u8; ZIP_CHUNK]);
-        debug_assert_eq!(buf.len(), ZIP_CHUNK);
-        match f.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if tx
-                    .blocking_send(StreamItem::Chunk { data: buf, len: n })
-                    .is_err()
-                {
-                    return false;
-                }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                error = Some(e);
+                false
             }
         }
+    });
+
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    true
 }
 
-#[must_use]
-pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
-    Router::new()
-        .push(
-            Router::with_path("/api/list/{**path}")
-                .filter(filters::get())
-                .goal(ListApi::new(root.clone(), port)),
-        )
-        .push(
-            Router::with_path("/api/zip/{**path}")
-                .filter(filters::get())
-                .goal(ZipApi::new(root.clone())),
-        )
-        .push(
-            Router::with_path("/api/stream/{**path}")
-                .filter(filters::get())
-                .goal(StreamApi::new(root)),
-        )
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<()> {
+    let mut offset = 0_u64;
+    let mut remaining = size;
+    while remaining > 0 {
+        match rustix::fs::sendfile(socket, file, Some(&mut offset), remaining as usize) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "文件在发送途中缩短",
+                ));
+            }
+            Ok(n) => remaining -= n as u64,
+            Err(rustix::io::Errno::INTR) => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn sendfile_all(socket: &mut TcpStream, file: &File, size: u64) -> std::io::Result<()> {
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut remaining = size;
+    let mut file_ref = file;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file_ref.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "文件在发送途中缩短",
+            ));
+        }
+        socket.write_all(&buf[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(())
 }
 
 /// 发一个文件：装得下一块就走整条目写入，否则流式分块。返回是否应继续遍历。
@@ -630,21 +560,15 @@ pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
 fn send_one_file(
     item_tx: &tokio::sync::mpsc::Sender<Item>,
     free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-    abs: &std::path::Path,
+    file: File,
+    size: u64,
     name: String,
 ) -> bool {
-    let Ok(mut f) = std::fs::File::open(abs) else {
-        // 打不开的文件仍留一个空条目，与原先 open 失败后立即 close 的行为一致
-        return item_tx.blocking_send(Item::FileStart { name }).is_ok()
-            && item_tx.blocking_send(Item::FileEnd).is_ok();
-    };
+    let mut f = file;
     // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
-    // 取元数据失败时按大文件走：读的时候会撞到同一个错误，`send_file_chunks` 立刻收尾发空条目。
-    // 用 `is_ok_and` 而不是 `map_or(usize::MAX, ...)`——后者读者得对照 `ZIP_CHUNK` 的类型才能
-    // 判断这条比较是否安全，而 `m.len()` 本来就是 `u64`，不必先截成 `usize`
-    let is_small = f.metadata().is_ok_and(|m| m.len() < ZIP_CHUNK as u64);
+    let is_small = size < ZIP_CHUNK as u64;
     if is_small {
         let (buf, len) = read_first_chunk(&mut f, free_rx);
         if len < ZIP_CHUNK {
@@ -679,10 +603,10 @@ fn send_one_file(
 /// 返回的有效长度等于 `ZIP_CHUNK` 时说明文件一块装不下（或它在 `fstat` 之后长大了），
 /// 调用方应继续走流式路径。
 fn read_first_chunk(
-    file: &mut std::fs::File,
+    file: &mut File,
     free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> (Vec<u8>, usize) {
-    let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0u8; ZIP_CHUNK]);
+    let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0_u8; ZIP_CHUNK]);
     let mut len = 0;
     while len < ZIP_CHUNK {
         match file.read(&mut buf[len..]) {
@@ -702,11 +626,13 @@ fn read_first_chunk(
 fn send_file_chunks(
     tx: &tokio::sync::mpsc::Sender<Item>,
     free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-    file: &mut std::fs::File,
+    file: &mut File,
     chunk_size: usize,
 ) -> bool {
     loop {
-        let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0u8; chunk_size]);
+        let mut buf = free_rx
+            .try_recv()
+            .unwrap_or_else(|_| vec![0_u8; chunk_size]);
         // 归还的缓冲始终满长，这里只读不截断，才能原样复用
         debug_assert_eq!(buf.len(), chunk_size);
         match file.read(&mut buf) {
@@ -718,6 +644,21 @@ fn send_file_chunks(
             }
         }
     }
+}
+
+#[must_use]
+pub fn list_routes(root: PathBuf, port: u16) -> Router {
+    Router::new()
+        .push(
+            Router::with_path("/api/list/{**path}")
+                .filter(filters::get())
+                .goal(ListApi::new(root.clone(), port)),
+        )
+        .push(
+            Router::with_path("/api/zip/{**path}")
+                .filter(filters::get())
+                .goal(ZipApi::new(root)),
+        )
 }
 
 #[cfg(test)]
