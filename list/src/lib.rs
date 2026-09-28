@@ -576,12 +576,10 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     });
 
     // 收尾：把缓冲区里最后那点没写出去的头/内容刷出去
-    if error.is_none()
-        && !head_buf.is_empty()
-        && let Err(e) = socket.write_all(&head_buf)
-    {
-        error = Some(e);
-    }
+    if error.is_none() && !head_buf.is_empty()
+        && let Err(e) = socket.write_all(&head_buf) {
+            error = Some(e);
+        }
 
     match error {
         Some(e) => Err(e),
@@ -589,6 +587,60 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     }
 }
 
+/// 把 `file` 从 `offset` 起、共 `remaining` 字节写到 socket。
+///
+/// `sendfile`/`splice` 不可用时的用户态兜底：非 Linux 平台直接用它，Linux/Android 上
+/// 文件系统不支持 `sendfile`（fuse 类挂载等会回 `EINVAL`）时也回退到这里。
+///
+/// 用 `pread`（Unix）/ `try_clone` + `seek`（其他）读文件，不动共享的文件偏移量：
+/// `/stream` 的 fd 是 `openat` 拿到的，可能还有其他引用；移动偏移量会互相干扰。
+fn copy_user(
+    mut socket: &TcpStream,
+    file: &File,
+    offset: u64,
+    remaining: u64,
+) -> std::io::Result<()> {
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut offset = offset;
+    let mut remaining = remaining;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = read_at(file, &mut buf[..want], offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "文件在发送途中缩短",
+            ));
+        }
+        socket.write_all(&buf[..n])?;
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// 从文件 `offset` 处读最多 `buf.len()` 字节，返回实读字节数。不改动文件偏移量。
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut owned = file.try_clone()?;
+        owned.seek(SeekFrom::Start(offset))?;
+        owned.read(buf)
+    }
+}
+
+/// 用 `sendfile(2)` 把 `file` 全部 `size` 字节写到 socket；不可用时回退到用户态读写。
+///
+/// 编译期：非 Linux/Android 直接走 [`copy_user`]。
+/// 运行时：Linux/Android 上若 `sendfile` 因为文件系统不支持而回 `EINVAL`/`ENOSYS`/
+/// `EOPNOTSUPP`，已经搬走的字节数保留在 `offset` 里，剩下的交给 [`copy_user`] 继续——
+/// 这样即便根目录挂在 fuse 上，`/stream` 也不会中途断连。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<()> {
     let mut offset = 0_u64;
@@ -603,6 +655,15 @@ fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<(
             }
             Ok(n) => remaining -= n as u64,
             Err(rustix::io::Errno::INTR) => (),
+            // 文件系统不支持 sendfile（fuse 类挂载、部分网络文件系统等）：回退到
+            // 用户态读写，从已经搬走的 offset 接着发，已经写出去的头不会被破坏
+            Err(e)
+                if e == rustix::io::Errno::INVAL
+                    || e == rustix::io::Errno::NOSYS
+                    || e == rustix::io::Errno::OPNOTSUPP =>
+            {
+                return copy_user(socket, file, offset, remaining);
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -610,23 +671,8 @@ fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn sendfile_all(socket: &mut TcpStream, file: &File, size: u64) -> std::io::Result<()> {
-    let mut buf = vec![0_u8; 64 * 1024];
-    let mut remaining = size;
-    let mut file_ref = file;
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let n = file_ref.read(&mut buf[..want])?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "文件在发送途中缩短",
-            ));
-        }
-        socket.write_all(&buf[..n])?;
-        remaining -= n as u64;
-    }
-    Ok(())
+fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<()> {
+    copy_user(socket, file, 0, size)
 }
 
 /// 发一个文件：装得下一块就走整条目写入，否则流式分块。返回是否应继续遍历。
