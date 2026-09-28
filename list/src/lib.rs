@@ -446,6 +446,39 @@ impl ZipApi {
 const STREAM_DIR: u8 = 0;
 const STREAM_FILE: u8 = 1;
 
+/// 服务端头部缓冲区的大小，也是「小文件直接塞进缓冲区」的上限。
+///
+/// 头部分（类型字节 + NUL 结尾路径 + 8 字节长度）每条不到一百字节，逐条 `write_all`
+/// 会把一个 8 万文件的树打成几十万次 `write` 系统调用——在回环/局域网上远超正文开销。
+/// 这里把所有头部分和小于阈值的小文件内容都攒进一个缓冲区，凑够一次写出。
+const STREAM_BUF: usize = 64 * 1024;
+
+/// 小于这个大小的文件不单独走 `sendfile`，内容读进 [`STREAM_BUF`] 与头部一起发出。
+///
+/// `sendfile` 对小文件是净亏：一次 `sendfile` 调用的固定开销远大于它省下的那次用户态
+/// 拷贝（回环上尤其明显，内核本来就要把数据拷进接收端 socket 缓冲）。小文件走
+/// 「读进用户态缓冲 + 与头部一起 write」，一次 `write` 能覆盖几十条记录。
+const SENDFILE_THRESHOLD: u64 = 64 * 1024;
+
+/// 从文件开头读满 `buf`，不改动文件偏移量（Unix 用 `pread`，非 Unix 复制 fd 后用 `seek`）。
+///
+/// `/stream` 的小文件走这里：`openat(dirfd, ...)` 拿到的 fd 是共享给 `sendfile` 的，
+/// 用 `pread` 读不会移动偏移量；非 Unix 没有 `pread`，复制一份 fd 后 `seek` 到 0 再读。
+fn read_file_prefix(file: &File, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, 0)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut owned = file.try_clone()?;
+        owned.seek(SeekFrom::Start(0))?;
+        owned.read_exact(buf)
+    }
+}
+
 /// 服务 `/stream/<sub>`：把整棵子树流成紧凑格式，文件正文用 `sendfile(2)` 零拷贝。
 ///
 /// 调用方（`app/src/fast.rs` 的 accept 分流）已经读过请求行、解析出路径；本函数
@@ -454,6 +487,10 @@ const STREAM_FILE: u8 = 1;
 ///
 /// 回调只返回 `bool`（是否继续遍历），因此把会返回 `Err` 的部分收进一个内部闭包，
 /// 由外层把 `Err` 记进 `error` 并停表。
+///
+/// 小文件（< [`SENDFILE_THRESHOLD`]）的内容读进 [`STREAM_BUF`]，与头部一起一次写出；
+/// 大文件先 flush 头部缓冲，正文交给 `sendfile` 直发。这样每棵树的 `write` 系统调用
+/// 数由条目数降到「每 64 KiB 一次」，而大文件的正文仍然完全走内核零拷贝。
 pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
@@ -470,12 +507,22 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     // 遍历时只有 `bool` 可用，把 IO 结果收在 `error` 上；回调每次开头检查它，
     // 一旦出错就立刻返回 `false` 停下遍历。
     let mut error: Option<std::io::Error> = None;
+    // 头 + 小文件内容的攒批缓冲。它同时服务两类条目：目录头只有几十字节，
+    // 攒下来减少系统调用；小于阈值的小文件内容也读进来，跟头一起写出。
+    let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
+
     zip::walk(&target, "", &mut |entry| {
         if error.is_some() {
             return false;
         }
         // 内层闭包返回 `Result`，`?` 就能用了
         let result: std::io::Result<()> = (|| {
+            // 缓冲区够大就先刷一次：即使条目都是长路径或大目录，它也不会无界增长
+            if head_buf.len() >= STREAM_BUF / 2 {
+                socket.write_all(&head_buf)?;
+                head_buf.clear();
+            }
+
             match entry {
                 zip::Entry::Dir { name } => {
                     // walk 给的 name 形如 `/sub/`；剥掉首尾斜杠即相对路径，根目录条目为空跳过
@@ -484,17 +531,37 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
                         // 根目录条目自身不发出
                         return Ok(());
                     }
-                    socket.write_all(&[STREAM_DIR])?;
-                    socket.write_all(rel.as_bytes())?;
-                    socket.write_all(&[0])?;
+                    head_buf.push(STREAM_DIR);
+                    head_buf.extend_from_slice(rel.as_bytes());
+                    head_buf.push(0);
                 }
                 zip::Entry::File { file, size, name } => {
                     let rel = name.trim_start_matches('/');
-                    socket.write_all(&[STREAM_FILE])?;
-                    socket.write_all(rel.as_bytes())?;
-                    socket.write_all(&[0])?;
-                    socket.write_all(&size.to_le_bytes())?;
-                    sendfile_all(socket, &file, size)?;
+                    // 头部三个 write_all 合并进缓冲区一次写出
+                    head_buf.push(STREAM_FILE);
+                    head_buf.extend_from_slice(rel.as_bytes());
+                    head_buf.push(0);
+                    head_buf.extend_from_slice(&size.to_le_bytes());
+
+                    if size < SENDFILE_THRESHOLD {
+                        // 小文件：内容读进缓冲区，与头部一起发。
+                        // 先把 head_buf 扩到够长，再 `read_exact_at` 填进去。
+                        let start = head_buf.len();
+                        head_buf.resize(start + size as usize, 0);
+                        read_file_prefix(&file, &mut head_buf[start..])?;
+                        // 单个小文件可能把缓冲区顶满，顺手刷一次；不刷下一轮开头也会刷
+                        if head_buf.len() >= STREAM_BUF {
+                            socket.write_all(&head_buf)?;
+                            head_buf.clear();
+                        }
+                    } else {
+                        // 大文件：头部先出去，正文交给 sendfile。
+                        // 先刷头部能保证 `Content-Length` 那 8 字节跟头部分一起落到
+                        // 对端缓冲，不会跟随后的 sendfile 抢一个 MSS 段。
+                        socket.write_all(&head_buf)?;
+                        head_buf.clear();
+                        sendfile_all(socket, &file, size)?;
+                    }
                 }
             }
             Ok(())
@@ -507,6 +574,14 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
             }
         }
     });
+
+    // 收尾：把缓冲区里最后那点没写出去的头/内容刷出去
+    if error.is_none()
+        && !head_buf.is_empty()
+        && let Err(e) = socket.write_all(&head_buf)
+    {
+        error = Some(e);
+    }
 
     match error {
         Some(e) => Err(e),

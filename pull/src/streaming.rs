@@ -8,6 +8,11 @@
 //! `tokio::fs` 的每次 `File::create` / `write_all` / `close` 和 `create_dir_all` 都是一次
 //! `spawn_blocking` 派发；12.4 万文件 + 9.6 万目录量级下这几十万次派发比正文本身还贵。
 //! 也不经过 chunked 解码——正文直接从 socket `splice` 进文件。
+//!
+//! 头部分（类型字节、NUL 结尾路径、8 字节长度）通过一个用户态缓冲批量读取：逐字节
+//! `read_exact` 对每个文件会产生十几次系统调用，循环十万文件就是几百万次，在回环或
+//! 局域网上远超正文本身的开销；缓冲后头部分只在缓冲耗尽时读一次 socket。文件正文不再
+//! 从缓冲里搬——缓冲区里已有的那点正文先落盘，剩余的直接 `splice` 进文件。
 
 use std::{
     fs::File,
@@ -21,6 +26,12 @@ use crate::fetch::encode_path;
 use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::splice::{Moved, transfer};
+
+/// 流式响应头部分的读取缓冲大小。
+///
+/// 头部分（类型 + 路径 + 长度）每条不到一百字节，一次 `read` 能覆盖几十条；正文超过
+/// 这个缓冲时剩余的走 `splice`，缓冲区里的那部分照常落盘。
+const STREAM_READ_BUF: usize = 64 * 1024;
 
 /// 一次流式拉取的统计。
 #[derive(Default)]
@@ -79,11 +90,12 @@ fn fetch_stream_blocking(
     std::fs::create_dir_all(target)?;
     let mut stats = StreamStats::default();
     let mut path_buf = Vec::with_capacity(256);
+    let mut reader = BufferedSocket::new(&stream);
 
     loop {
         // 1 字节类型；干净 EOF 视作收尾
         let mut kind = [0_u8; 1];
-        match stream.read_exact(&mut kind) {
+        match reader.read_exact(&mut kind) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
@@ -91,16 +103,9 @@ fn fetch_stream_blocking(
 
         // 读 NUL 结尾的相对路径
         path_buf.clear();
-        loop {
-            let mut b = [0_u8; 1];
-            stream.read_exact(&mut b)?;
-            if b[0] == 0 {
-                break;
-            }
-            path_buf.push(b[0]);
-            if path_buf.len() > 8192 {
-                return Err(Error::Malformed("远端返回的路径过长"));
-            }
+        reader.read_until_nul(&mut path_buf)?;
+        if path_buf.len() > 8192 {
+            return Err(Error::Malformed("远端返回的路径过长"));
         }
         // 防御性检查：远端不该发来绝对路径或 `..`
         if path_buf.starts_with(b"/") || path_buf.split(|&b| b == b'/').any(|p| p == b"..") {
@@ -117,14 +122,14 @@ fn fetch_stream_blocking(
             }
             1 => {
                 let mut size_buf = [0_u8; 8];
-                stream.read_exact(&mut size_buf)?;
+                reader.read_exact(&mut size_buf)?;
                 let size = u64::from_le_bytes(size_buf);
                 let file_path = target.join(&rel);
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 let file = File::create(&file_path)?;
-                stream_file_content(&stream, &file, size, remote, &rel)?;
+                stream_file_content(&stream, &file, size, remote, &rel, &mut reader)?;
                 stats.files += 1;
                 stats.bytes += size;
             }
@@ -134,24 +139,42 @@ fn fetch_stream_blocking(
     Ok(stats)
 }
 
-/// 把下一段 `size` 字节从 socket 搬进文件。Linux/Android 上优先 `splice(2)`。
+/// 把下一段 `size` 字节从 socket 搬进文件。
+///
+/// 缓冲区里已有的正文先落盘（通常是上一次 `fill` 顺手读进来的），剩余的直接
+/// `splice(2)` 进文件，不再经过用户态。
 fn stream_file_content(
     socket: &TcpStream,
     file: &File,
     size: u64,
     remote: &str,
     rel: &str,
+    reader: &mut BufferedSocket<'_>,
 ) -> Result<(), Error> {
     if size == 0 {
         return Ok(());
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Moved::Done(_) = transfer(socket, file, size)? {
+
+    // 先把缓冲区里已有的那截正文落盘。缓冲区里可能只装了正文的一部分（大文件），
+    // 也可能装了全部（小文件）——`take` 取两者的最小值。
+    let from_buf = reader.available().min(size as usize);
+    if from_buf > 0 {
+        reader.consume_to(from_buf, file)?;
+    }
+    let remaining = size - from_buf as u64;
+    if remaining == 0 {
         return Ok(());
     }
+
+    // 剩下的正文不在缓冲区里，直接从 socket 搬。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Moved::Done(_) = transfer(socket, file, remaining)? {
+        return Ok(());
+    }
+
     // 非 Linux/Android，或目标文件系统不支持 splice_write：用户态读写兜底
     let mut buf = vec![0_u8; 64 * 1024];
-    let mut remaining = size;
+    let mut remaining = remaining;
     let mut socket_ref = socket;
     let mut file_ref = file;
     while remaining > 0 {
@@ -168,6 +191,87 @@ fn stream_file_content(
         remaining -= n as u64;
     }
     Ok(())
+}
+
+/// 带用户态缓冲的 socket 读取器。
+///
+/// 头部分（类型字节、NUL 结尾路径、8 字节长度）逐字节读取会产生大量 `read` 系统调用：
+/// 路径平均几十字节，一千万个文件就是几亿次。这里一次 `read` 预读一整块到用户态，头部分
+/// 全在内存里解析；缓冲区耗尽才再读一次 socket。
+///
+/// 正文不从这里走：`stream_file_content` 会先把缓冲区里已有的正文落盘，剩余的直接
+/// `splice(2)`——缓冲区只服务头部分。
+struct BufferedSocket<'a> {
+    socket: &'a TcpStream,
+    buf: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> BufferedSocket<'a> {
+    fn new(socket: &'a TcpStream) -> Self {
+        Self {
+            socket,
+            buf: vec![0_u8; STREAM_READ_BUF].into_boxed_slice(),
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// 从 socket 读一块进缓冲区；返回是否读到数据（`false` 表示 EOF）。
+    fn fill(&mut self) -> io::Result<bool> {
+        self.start = 0;
+        self.end = self.socket.read(&mut self.buf)?;
+        Ok(self.end > 0)
+    }
+
+    fn read_exact(&mut self, out: &mut [u8]) -> io::Result<()> {
+        let mut written = 0;
+        while written < out.len() {
+            if self.start == self.end && !self.fill()? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let n = (self.end - self.start).min(out.len() - written);
+            out[written..written + n].copy_from_slice(&self.buf[self.start..self.start + n]);
+            self.start += n;
+            written += n;
+        }
+        Ok(())
+    }
+
+    /// 读到 NUL（不含）为止，把 NUL 之前的字节追加进 `out`。
+    fn read_until_nul(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            if self.start == self.end && !self.fill()? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let search = &self.buf[self.start..self.end];
+            // `memchr` 一次扫完整块缓冲：路径平均几十字节，逐字节比较在内层循环里
+            if let Some(pos) = memchr::memchr(0, search) {
+                out.extend_from_slice(&search[..pos]);
+                self.start += pos + 1;
+                return Ok(());
+            }
+            out.extend_from_slice(search);
+            self.start = self.end;
+        }
+    }
+
+    /// 缓冲区里还有多少字节没被消费。
+    const fn available(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// 把缓冲区里最多 `n` 字节写进 `file`，返回实际写入的字节数。
+    fn consume_to(&mut self, n: usize, file: &File) -> io::Result<usize> {
+        let take = self.available().min(n);
+        // `&File` 实现了 `Write`（`File` 的 `impl Write for &File`），这里借一个
+        // 可变的 `&File` 就能直接写，不需要 `try_clone` 出一份新 fd
+        let mut writer = file;
+        writer.write_all(&self.buf[self.start..self.start + take])?;
+        self.start += take;
+        Ok(take)
+    }
 }
 
 /// 读状态行 + 跳响应头，返回状态码。响应头里的 `Content-Length` 用不到（服务端不发长度、
