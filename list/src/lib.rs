@@ -446,6 +446,164 @@ impl ZipApi {
     }
 }
 
+// ---- /api/stream：一次 HTTP 请求把整棵子树流成紧凑格式，客户端边收边落盘 ----
+
+/// 流里的一个条目：目录、文件头、或一块文件内容。
+enum StreamItem {
+    Dir { path: String },
+    FileStart { path: String, size: u64 },
+    Chunk { data: Vec<u8>, len: usize },
+}
+
+/// 协议标记：每个条目前 1 字节类型，路径以 NUL 结尾，文件随后跟 8 字节小端长度。
+/// 正文紧跟 `FileStart` 之后，恰好 `size` 字节。
+const STREAM_DIR: u8 = 0;
+const STREAM_FILE: u8 = 1;
+const STREAM_EOF: u8 = 2;
+
+struct StreamApi {
+    root: PathBuf,
+}
+
+impl StreamApi {
+    #[must_use]
+    const fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[handler]
+impl StreamApi {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        let path = req.param::<String>("path").unwrap_or_default();
+        let root = self.root.clone();
+
+        let resolved = tokio::task::spawn_blocking(move || {
+            let canonical = resolve_under(&root, &path)?;
+            canonical.is_dir().then_some(canonical)
+        })
+        .await;
+
+        let Ok(resolved) = resolved else {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        };
+        let Some(canonical) = resolved else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        };
+
+        res.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+
+        // 与 ZipApi 同一套流水线：阻塞遍历线程 → 有界 channel → 异步写。
+        let (item_tx, mut item_rx) = tokio::sync::mpsc::channel::<StreamItem>(ZIP_QUEUE);
+        let (free_tx, mut free_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ZIP_QUEUE);
+
+        tokio::task::spawn_blocking(move || {
+            zip::walk(&canonical, "", &mut |entry| match entry {
+                zip::Entry::Dir { name } => {
+                    // walk 给的 name 形如 `/sub/`；剥掉首尾斜杠即相对路径，根目录条目为空跳过
+                    let dir = name.trim_start_matches('/').trim_end_matches('/');
+                    if dir.is_empty() {
+                        return true;
+                    }
+                    item_tx
+                        .blocking_send(StreamItem::Dir {
+                            path: dir.to_string(),
+                        })
+                        .is_ok()
+                }
+                zip::Entry::File { abs, name } => {
+                    let rel = name.trim_start_matches('/').to_string();
+                    send_stream_file(&item_tx, &mut free_rx, &abs, rel)
+                }
+            });
+        });
+
+        let tx = res.channel();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let mut writer = tokio::io::BufWriter::with_capacity(ZIP_FLUSH, tx);
+            while let Some(item) = item_rx.recv().await {
+                let result: std::io::Result<()> = async {
+                    match item {
+                        StreamItem::Dir { path } => {
+                            writer.write_all(&[STREAM_DIR]).await?;
+                            writer.write_all(path.as_bytes()).await?;
+                            writer.write_all(&[0]).await?;
+                        }
+                        StreamItem::FileStart { path, size } => {
+                            writer.write_all(&[STREAM_FILE]).await?;
+                            writer.write_all(path.as_bytes()).await?;
+                            writer.write_all(&[0]).await?;
+                            writer.write_all(&size.to_le_bytes()).await?;
+                        }
+                        StreamItem::Chunk { data, len } => {
+                            writer.write_all(&data[..len]).await?;
+                            // 池满就丢弃，只是少一次复用，不影响正确性
+                            let _ = free_tx.try_send(data);
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if result.is_err() {
+                    return;
+                }
+            }
+            let _ = writer.write_all(&[STREAM_EOF]).await;
+            let _ = writer.flush().await;
+        });
+    }
+}
+
+/// 发一个文件：先发头（相对路径 + 长度），再分块发内容。返回是否应继续遍历。
+fn send_stream_file(
+    tx: &tokio::sync::mpsc::Sender<StreamItem>,
+    free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    abs: &std::path::Path,
+    name: String,
+) -> bool {
+    let Ok(mut f) = std::fs::File::open(abs) else {
+        return true; // 打不开的文件跳过，不中断整棵树
+    };
+    let Ok(meta) = f.metadata() else {
+        return true;
+    };
+    let size = meta.len();
+
+    if tx
+        .blocking_send(StreamItem::FileStart { path: name, size })
+        .is_err()
+    {
+        return false;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::Sequential);
+
+    loop {
+        let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0u8; ZIP_CHUNK]);
+        debug_assert_eq!(buf.len(), ZIP_CHUNK);
+        match f.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tx
+                    .blocking_send(StreamItem::Chunk { data: buf, len: n })
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 #[must_use]
 pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
     Router::new()
@@ -457,7 +615,12 @@ pub fn list_routes(root: std::path::PathBuf, port: u16) -> Router {
         .push(
             Router::with_path("/api/zip/{**path}")
                 .filter(filters::get())
-                .goal(ZipApi::new(root)),
+                .goal(ZipApi::new(root.clone())),
+        )
+        .push(
+            Router::with_path("/api/stream/{**path}")
+                .filter(filters::get())
+                .goal(StreamApi::new(root)),
         )
 }
 
