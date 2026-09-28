@@ -5,18 +5,23 @@
 //! - 裸 host：`http://h [remote] [local]`——`remote` 缺省拉根；给了名字先试目录，
 //!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
 //! - 直链：URL 的路径或 fragment 直接指明远端——`http://h/files/<sub>`、`http://h/pull/<sub>`
-//!   当文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>`、`http://h/#<sub>` 当目录，
+//!   当文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录，
+//!   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走流式（一次请求整棵树），
 //!   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、文件还是目录交给 `/api/list` 探测。
 //!
-//! 只走服务端两个 GET 端点：
+//! 服务端三个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
-//! - `/pull/<sub>` 逐个文件落盘。`/pull` 是拉取专用的端点：不碰 `/files` 那套 fd 缓存，
-//!   也不编码拉取端用不到的 `ETag`、`Last-Modified` 与 `Content-Disposition`（见 `lanfile_assets`）。
+//! - `/pull/<sub>` 逐个文件落盘（逐个拉取时用）；
+//! - `/api/stream/<sub>` 把整棵子树流成紧凑格式（流式模式用，一次事务）。
 //!
-//! 并发拉取：同一层目录里的文件各起一个任务，用 `buffer_unordered(DOWNLOAD_CONCURRENCY)`
-//! 限制同时在飞的任务数。目录递归保持串行——树是流式处理的，先把目录攒起来再并发会
-//! 让整棵树的展开碎掉、内存上界也失控；同层文件并发已经能吃满客户端的多核。连接池
-//! [`Pool`] 内部有锁，每个任务各借一条连接，互不影响。
+//! 流式模式：客户端一次请求，服务端边遍历边发，事务数从 2N 降到 1，回环与局域网上
+//! 每次事务的固定开销不再随文件数累加。逐个拉取模式保留：`/api/list` 与 `/api/zip`
+//! 直链仍按原路径走（兼容既有脚本），`--flat` 语义两边一致。
+//!
+//! 并发拉取（逐个拉取模式）：同一层目录里的文件各起一个任务，用
+//! `buffer_unordered(DOWNLOAD_CONCURRENCY)` 限制同时在飞的任务数。目录递归保持串行——
+//! 树是流式处理的，先把目录攒起来再并发会让整棵树的展开碎掉、内存上界也失控；同层文件并发
+//! 已经能吃满客户端的多核。连接池 [`Pool`] 内部有锁，每个任务各借一条连接，互不影响。
 //!
 //! 正文严格按响应声明的 `Content-Length` 读满即停：长度不再是事后校验，而是读取本身的停止
 //! 条件，读满的连接干净、直接归还池子复用。响应必须带 `Content-Length`
@@ -25,7 +30,7 @@
 //! 哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次请求会换一条新连接重试一次。
 //! 正文在 Linux/Android 且目标文件系统支持时走 `splice(2)` 零拷贝落盘，其余平台或文件系统
 //! 退回用户态读写，落盘内容与截断判定两边一致。结构上每个文件的抓取收口在 [`fetch_file`]、
-//! 目录枚举收口在 [`list_entries`]。
+//! 目录枚举收口在 [`list_entries`]、整树流式收口在 [`streaming::fetch_stream`]。
 
 mod args;
 mod error;
@@ -33,6 +38,7 @@ mod fetch;
 mod http;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod splice;
+mod streaming;
 
 pub use error::{BoxError, Error};
 
@@ -42,23 +48,25 @@ use crate::http::Pool;
 use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 
-/// 同层目录里同时在飞的文件任务数。
+/// 同层目录里同时在飞的文件任务数（逐个拉取模式）。
 ///
 /// 客户端与服务端都在本机、服务端几乎不占 CPU 时，串行拉取被逐个文件的往返时延卡住；
 /// 8 路并发把等待重叠起来，同时不会让服务端的 `FileCache` 分片锁或客户端磁盘写成为瓶颈。
 /// 一个文件一个连接，pool 的容量由这个数自然定住。
+///
+/// 流式模式（`Kind::Stream`）不走这条路径，因此这个常量对最常见的 `#<sub>` 直链无影响。
 const DOWNLOAD_CONCURRENCY: usize = 8;
 
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
-/// 两种来源：
+/// 来源两种：
 /// - 裸 host（`http://h <remote> [local] [--flat]`）：`remote` 必给——拉根被禁，会在连服务端前
-///   直接报错；给了名字则先试目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉（对
-///   `lanfile get http://h a.tgz` 不再因 `/api/list` 404 直接失败，而是改走 `/pull` 把文件拉下来）。
+///   直接报错；给了名字则先试目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉。
 /// - 直链（URL 的路径/fragment 已指明远端）：`http://h/files/<sub>`、`http://h/pull/<sub>` 当
-///   文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>`、`http://h/#<sub>` 当目录，其余
-///   非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、kind 交给 `/api/list` 探测；不给
-///   `local` 则落进当前目录（文件取末段为名）。
+///   文件；`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录（逐个拉）；
+///   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走流式（一次请求整棵树）；
+///   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、kind 交给 `/api/list` 探测；
+///   不给 `local` 则落进当前目录（文件取末段为名）。
 ///
 /// 落盘语义对齐 `scp -r`：默认拉目录时在 `local` 下套一层以远端目录名命名的子目录
 /// （`local/dir/`）；`--flat`/`-f` 不套层，目录内容直接落 `local`（恢复 8f8a234 前的默认）。
@@ -67,6 +75,8 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
     let pool = Pool::default();
     match p.kind {
+        // 流式：不借池、不并发，一条连接把整棵树收下来。
+        Kind::Stream => run_stream(&p).await,
         // 直链已指明 kind：文件直接拉、目录当目录拉。
         Kind::File => run_file(&pool, &p).await,
         Kind::Dir => run_dir(&pool, &p, false).await,
@@ -143,6 +153,22 @@ fn to_not_found(error: Error, remote: &str) -> Error {
         },
         other => other,
     }
+}
+
+/// 流式模式：一次 `GET /api/stream/<remote>` 把整棵树拉下来。
+async fn run_stream(p: &Parsed) -> Result<(), BoxError> {
+    let target = local_target(&p.local, &p.remote, p.flat);
+    let stats = streaming::fetch_stream(&p.host, &p.remote, &target).await?;
+    eprintln!(
+        "lanfile get: {}/{} -> {}（流式：{} 文件，{} 目录，{} 字节）",
+        p.base,
+        p.remote,
+        target.display(),
+        stats.files,
+        stats.dirs,
+        stats.bytes,
+    );
+    Ok(())
 }
 
 /// 当文件拉 `/pull/<remote>`；404 统一转成「远端不存在」（裸 host 探测到这一步即目录与文件都不是）。

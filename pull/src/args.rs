@@ -28,10 +28,12 @@ pub struct Parsed {
 pub enum Kind {
     /// 裸 host + 名字：先试目录，404 再当文件。
     Auto,
-    /// `/api/zip/`、`/api/list/`、`/#<sub>` 直链：当目录。
+    /// `/api/zip/`、`/api/list/` 直链：当目录（逐个文件拉）。
     Dir,
     /// `/files/`、`/pull/` 直链：直接当文件。
     File,
+    /// `/api/stream/<sub>` 或 `/#<sub>`：一次请求把整棵树流下来。
+    Stream,
 }
 
 /// 解析命令行：`<base_url|直链> [remote] [local] [--flat]`。
@@ -128,7 +130,7 @@ fn parse_source(url: &str) -> Result<Source, Error> {
 
 /// 认直链，给出 URL 里已经指明的那条远端路径：
 /// - `/files/<sub>`、`/pull/<sub>` 当文件，`/api/zip/<sub>`、`/api/list/<sub>` 当目录；
-/// - `/#<sub>` 当目录；
+/// - `/api/stream/<sub>` 与 `/#<sub>` 走流式（一次请求拉整棵树）；
 /// - 其余非空路径本身就是远端，kind 待探测——`http://h/.pi` 等价于 `lanfile get http://h .pi`；
 /// - 只有空路径（`http://h`、`http://h/`）返回 `None`，remote 留给位置参数。
 fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
@@ -152,15 +154,25 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
             kind: Kind::Dir,
         });
     }
+    // 显式流式端点。
+    if let Some(sub) = path
+        .strip_prefix("api/stream/")
+        .filter(|sub| !sub.is_empty())
+    {
+        return Some(Direct {
+            remote: percent_decode(sub),
+            kind: Kind::Stream,
+        });
+    }
     // 站内直链 /#<sub>：path 为空（`/`、`/#<sub>`，或没写 `/` 的 `#<sub>`）。`#` 在 `?` 之前时
-    // 用户多写的查询串也算 fragment（`/#sub?x=1`），一并切掉。
+    // 用户多写的查询串也算 fragment（`/#sub?x=1`），一并切掉。默认走流式。
     if path.is_empty() {
         let sub = fragment.trim_start_matches('/');
         let sub = sub.split_once('?').map_or(sub, |(sub, _)| sub);
         if !sub.is_empty() {
             return Some(Direct {
                 remote: percent_decode(sub),
-                kind: Kind::Dir,
+                kind: Kind::Stream,
             });
         }
         return None;
@@ -281,12 +293,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_fragment_after_query_direct_link_is_dir() {
+    fn parse_args_fragment_after_query_direct_link_is_stream() {
         // `?` 在 `#` 之前：`?` 之后是查询串，fragment 仍要认出来。
         let p = parse_args(&["http://h:1?x=1#filerserve".into()]).unwrap();
         assert_eq!(p.host, "h:1");
         assert_eq!(p.remote, "filerserve");
-        assert_eq!(p.kind, Kind::Dir);
+        assert_eq!(p.kind, Kind::Stream);
     }
 
     #[test]
@@ -294,7 +306,7 @@ mod tests {
         // `#` 在 `?` 之前：查询串随 fragment 一起被切掉。
         let p = parse_args(&["http://h:1/#filerserve?x=1".into()]).unwrap();
         assert_eq!(p.remote, "filerserve");
-        assert_eq!(p.kind, Kind::Dir);
+        assert_eq!(p.kind, Kind::Stream);
     }
 
     #[test]
@@ -381,14 +393,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_fragment_direct_link_is_dir() {
+    fn parse_args_stream_direct_link_is_stream() {
+        let p = parse_args(&["http://h:1/api/stream/a/b".into()]).unwrap();
+        assert_eq!(p.remote, "a/b");
+        assert_eq!(p.kind, Kind::Stream);
+    }
+
+    #[test]
+    fn parse_args_fragment_direct_link_is_stream() {
         let p = parse_args(&["http://h:1/#filerserve".into()]).unwrap();
         assert_eq!(p.remote, "filerserve");
-        assert_eq!(p.kind, Kind::Dir);
+        assert_eq!(p.kind, Kind::Stream);
         // 不写 `/`、不带路径的 `#<sub>` 同样认
         let p = parse_args(&["http://h:1#filerserve".into()]).unwrap();
         assert_eq!(p.remote, "filerserve");
-        assert_eq!(p.kind, Kind::Dir);
+        assert_eq!(p.kind, Kind::Stream);
     }
 
     #[test]

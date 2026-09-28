@@ -278,7 +278,7 @@ async fn discard(local: &Path) {
 ///
 /// 转义直接查表手写两个 hex 字符，不走 `fmt::Write`：文件名带中文或空格时每个字节
 /// 都会走一次格式化分发，这条路径在每个文件下载时都会经过。
-fn encode_path(path: &str) -> String {
+pub fn encode_path(path: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(path.len());
     for &byte in path.as_bytes() {
