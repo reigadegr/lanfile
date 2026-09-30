@@ -175,6 +175,7 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
 
 /// accept 出错后的退避时间，取值与 salvo 的 `Server` 一致。
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+const MAX_STREAM_BATCH_BODY: usize = 64 * 1024 * 1024;
 
 /// 看一眼请求行是不是 `/stream/...`。
 ///
@@ -267,7 +268,8 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     let decoded = decode_url_path(encoded_target);
     if is_batch {
         if let Ok((shard, shards)) = parse_shard_query(query) {
-            lanfile_list::serve_stream_batch(&mut stream, root, &decoded, shard, shards)
+            let body = read_request_body(&mut stream, &head)?;
+            lanfile_list::serve_stream_batch(&mut stream, root, &decoded, shard, shards, &body)
         } else {
             stream.write_all(
                 b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -277,6 +279,36 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     } else {
         lanfile_list::serve_stream(&mut stream, root, &decoded)
     }
+}
+
+fn read_request_body(stream: &mut StdTcpStream, head: &[u8]) -> io::Result<Vec<u8>> {
+    let mut length = None;
+    for line in head.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
+            if length.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Content-Length 重复",
+                ));
+            }
+            let value = std::str::from_utf8(line[15..].trim_ascii())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Content-Length 不是文本"))?
+                .parse::<usize>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Content-Length 非法"))?;
+            length = Some(value);
+        }
+    }
+    let length = length.unwrap_or(0);
+    if length > MAX_STREAM_BATCH_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream-batch 请求体过大",
+        ));
+    }
+    let mut body = vec![0_u8; length];
+    stream.read_exact(&mut body)?;
+    Ok(body)
 }
 
 fn parse_shard_query(query: &str) -> io::Result<(u32, u32)> {

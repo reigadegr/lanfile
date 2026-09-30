@@ -47,10 +47,10 @@ use crate::fetch::{
     Fetched, ManifestEntry, RemoteEntry, Via, fetch_file, fetch_manifest, list_entries,
 };
 use crate::http::Pool;
-use crate::streaming::{fetch_stream_shard, shard_of};
+use crate::streaming::fetch_stream_shard;
 use futures_util::stream::{self, StreamExt};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -61,8 +61,11 @@ use std::{
 /// 一个文件一个连接，pool 的容量由这个数自然定住。
 ///
 const DOWNLOAD_CONCURRENCY: usize = 8;
-/// 分片流固定使用 4 条连接；先验证正确性与默认吞吐，再考虑配置化或自动调参。
+/// 分片流固定使用 4 条连接。
 const STREAM_SHARDS: u32 = 4;
+/// 单个目录亲和任务的最大文件数或字节数，超过后拆成连续小任务。
+const STREAM_TASK_MAX_FILES: usize = 512;
+const STREAM_TASK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
@@ -162,7 +165,7 @@ fn to_not_found(error: Error, remote: &str) -> Error {
     }
 }
 
-/// 清单模式：一次取 manifest，目录先建好，文件并发拉。
+/// 清单模式：一次取 manifest，目录先建好，文件按目录亲和分片并发拉。
 ///
 /// 旧服务端没有 manifest 端点时回退到原单连接流式，保持新旧版本可以互通。
 async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
@@ -173,20 +176,12 @@ async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
         Err(error) => return Err(error.into()),
     };
     let (mut stats, files) = prepare_manifest(&target, &entries).await?;
-    let stats = match pull_stream_shards(&p.host, &p.remote, &target, files).await {
-        Ok(stream_stats) => {
-            stats.files = stream_stats.files;
-            stats.bytes = stream_stats.bytes;
-            stats.via.spliced = stream_stats.spliced;
-            stats.via.copied = stream_stats.copied;
-            stats.via.prebuffered = stream_stats.prebuffered;
-            stats
-        }
-        Err(Error::Http { status: 404, .. }) => {
-            pull_manifest(pool, &p.host, &p.remote, &target, entries).await?
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let stream_stats = pull_stream_shards(&p.host, &p.remote, &target, files).await?;
+    stats.files = stream_stats.files;
+    stats.bytes = stream_stats.bytes;
+    stats.via.spliced = stream_stats.spliced;
+    stats.via.copied = stream_stats.copied;
+    stats.via.prebuffered = stream_stats.prebuffered;
     eprintln!(
         "lanfile get: {}/{} -> {}（清单分片流：{} 文件，{} 目录，{} 字节，跳过已存在 {} 个）",
         p.base,
@@ -393,61 +388,6 @@ async fn pull_entries(
     Ok(stats)
 }
 
-/// 按 manifest 落盘：目录先全建好（包括空目录），文件再并发抓。
-async fn pull_manifest(
-    pool: &Pool,
-    host: &str,
-    remote: &str,
-    local: &Path,
-    entries: Vec<ManifestEntry>,
-) -> Result<Stats, Error> {
-    tokio::fs::create_dir_all(local).await?;
-    let mut stats = Stats::default();
-    let mut file_tasks = Vec::new();
-
-    for entry in entries {
-        let local_child = local.join(&entry.path);
-        if entry.is_dir() {
-            tokio::fs::create_dir_all(&local_child).await?;
-            stats.dirs += 1;
-            continue;
-        }
-
-        stats.files += 1;
-        let remote_child = if remote.is_empty() {
-            entry.path.clone()
-        } else {
-            format!("{remote}/{}", entry.path)
-        };
-        let remote_size = entry.size;
-        file_tasks.push(async move {
-            if skip_existing(&local_child, remote_size).await {
-                return FileOutcome::Skipped;
-            }
-            match fetch_file(pool, host, &remote_child, &local_child).await {
-                Ok(fetched) => FileOutcome::Fetched(fetched),
-                Err(error) => FileOutcome::Failed(remote_child, error),
-            }
-        });
-    }
-
-    let outcomes = stream::iter(file_tasks)
-        .buffer_unordered(DOWNLOAD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    for outcome in outcomes {
-        match outcome {
-            FileOutcome::Skipped => stats.skipped += 1,
-            FileOutcome::Fetched(fetched) => {
-                stats.bytes += fetched.bytes;
-                stats.via.record(fetched.via);
-            }
-            FileOutcome::Failed(name, error) => eprintln!("  跳过 {name}：{error}"),
-        }
-    }
-    Ok(stats)
-}
-
 /// 先按 manifest 建出全部目录（包括空目录），并收集文件大小供 shard 校验。
 async fn prepare_manifest(
     local: &Path,
@@ -476,11 +416,7 @@ async fn pull_stream_shards(
     local: &Path,
     mut files: HashMap<String, u64>,
 ) -> Result<crate::streaming::StreamStats, Error> {
-    let mut shards: Vec<HashMap<String, u64>> = vec![HashMap::new(); STREAM_SHARDS as usize];
-    for (path, size) in files.drain() {
-        let shard = shard_of(&path, STREAM_SHARDS) as usize;
-        shards[shard].insert(path, size);
-    }
+    let shards = build_shard_tasks(&mut files);
 
     let mut tasks = Vec::with_capacity(STREAM_SHARDS as usize);
     for (shard, expected) in shards.into_iter().enumerate() {
@@ -505,6 +441,71 @@ async fn pull_stream_shards(
         stats.merge(&result);
     }
     Ok(stats)
+}
+
+struct ShardTask {
+    files: Vec<(String, u64)>,
+    bytes: u64,
+}
+
+/// 以父目录为任务单位做目录亲和，再按负载贪心分配。
+///
+/// 大目录拆成连续小块，避免一个目录拖慢单个 shard；大文件无法在当前协议内拆块，
+/// 会作为独立任务优先放到最空的 shard。
+fn build_shard_tasks(files: &mut HashMap<String, u64>) -> Vec<Vec<(String, u64)>> {
+    let mut directories: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+    for (path, size) in files.drain() {
+        let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+        directories
+            .entry(directory.to_owned())
+            .or_default()
+            .push((path, size));
+    }
+
+    let mut tasks = Vec::new();
+    for (_, mut group) in directories {
+        group.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut current = ShardTask {
+            files: Vec::new(),
+            bytes: 0,
+        };
+        for file @ (_, size) in group {
+            if !current.files.is_empty()
+                && (current.files.len() >= STREAM_TASK_MAX_FILES
+                    || current.bytes.saturating_add(size) > STREAM_TASK_MAX_BYTES)
+            {
+                tasks.push(current);
+                current = ShardTask {
+                    files: Vec::new(),
+                    bytes: 0,
+                };
+            }
+            current.bytes += size;
+            current.files.push(file);
+        }
+        if !current.files.is_empty() {
+            tasks.push(current);
+        }
+    }
+
+    // 最长处理时间优先：大任务先落位，小任务填空，减少尾部等待。
+    tasks.sort_unstable_by_key(|task| std::cmp::Reverse(task.bytes));
+    let mut shards = vec![Vec::new(); STREAM_SHARDS as usize];
+    let mut loads = vec![0_u64; STREAM_SHARDS as usize];
+    for task in tasks {
+        let mut lightest = 0;
+        for shard in 1..loads.len() {
+            if loads[shard] < loads[lightest] {
+                lightest = shard;
+            }
+        }
+        loads[lightest] += task.bytes;
+        shards[lightest].extend(task.files);
+    }
+    for files in &mut shards {
+        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+    shards
 }
 
 /// 本地已存在且尺寸与远端一致就跳过（尺寸级幂等，避免重复落盘）。
@@ -579,6 +580,27 @@ mod tests {
             local_target(Path::new("./dst"), "", true),
             PathBuf::from("./dst")
         );
+    }
+
+    #[test]
+    fn build_shard_tasks_balances_directory_tasks_without_losing_files() {
+        let mut files = HashMap::new();
+        for directory in 0..8 {
+            for file in 0..4 {
+                files.insert(format!("dir{directory}/file{file}"), 10_u64);
+            }
+        }
+
+        let shards = build_shard_tasks(&mut files);
+        let loads = shards
+            .iter()
+            .map(|files| files.iter().map(|(_, size)| size).sum::<u64>())
+            .collect::<Vec<_>>();
+        let count = shards.iter().map(Vec::len).sum::<usize>();
+
+        assert_eq!(count, 32);
+        assert_eq!(loads, [80, 80, 80, 80]);
+        assert!(files.is_empty());
     }
 
     /// 基准：`memrchr` 找末段 vs `trim_matches` + `rsplit`

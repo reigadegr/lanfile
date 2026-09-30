@@ -56,16 +56,9 @@ impl StreamStats {
     }
 }
 
-/// 按 manifest 相对路径计算稳定 shard；必须与服务端保持同一 FNV-1a 规则。
-#[must_use]
-pub fn shard_of(path: &str, shards: u32) -> u32 {
-    debug_assert!((1..=8).contains(&shards));
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in path.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash % shards
+struct StreamRequest {
+    path: String,
+    body: Option<Vec<u8>>,
 }
 
 /// 从 `host` 拉 `remote` 子树到本地 `target`（`target` 已经是落盘根目录，不含 basename 层）。
@@ -86,11 +79,14 @@ pub async fn fetch_stream(host: &str, remote: &str, target: &Path) -> Result<Str
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let request_path = format!("/stream/{}", encode_path(&remote_owned));
+        let request = StreamRequest {
+            path: format!("/stream/{}", encode_path(&remote_owned)),
+            body: None,
+        };
         fetch_stream_blocking(
             stream,
             &host_owned,
-            &request_path,
+            request,
             &remote_owned,
             &target_owned,
             true,
@@ -107,7 +103,7 @@ pub async fn fetch_stream_shard(
     target: &Path,
     shard: u32,
     shards: u32,
-    expected: HashMap<String, u64>,
+    entries: Vec<(String, u64)>,
 ) -> Result<StreamStats, Error> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(host))
         .await
@@ -121,15 +117,26 @@ pub async fn fetch_stream_shard(
     let host_owned = host.to_string();
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
+    let mut request_body = Vec::new();
+    for (path, size) in &entries {
+        request_body.extend_from_slice(path.as_bytes());
+        request_body.push(0);
+        request_body.extend_from_slice(&size.to_le_bytes());
+    }
+    let expected = entries.into_iter().collect::<HashMap<_, _>>();
     let request_path = format!(
         "/stream-batch/{}?shard={shard}&shards={shards}",
         encode_path(remote)
     );
+    let request = StreamRequest {
+        path: request_path,
+        body: Some(request_body),
+    };
     tokio::task::spawn_blocking(move || {
         fetch_stream_blocking(
             stream,
             &host_owned,
-            &request_path,
+            request,
             &remote_owned,
             &target_owned,
             false,
@@ -144,7 +151,7 @@ pub async fn fetch_stream_shard(
 fn fetch_stream_blocking(
     mut stream: TcpStream,
     host: &str,
-    request_path: &str,
+    request: StreamRequest,
     remote: &str,
     target: &Path,
     accept_dirs: bool,
@@ -155,17 +162,18 @@ fn fetch_stream_blocking(
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
-    let path = request_path;
-    stream.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )?;
+    let body = request.body.unwrap_or_default();
+    let path = request.path;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(&body)?;
 
     let status = read_response_head(&mut stream)?;
     if status != 200 {
-        return Err(Error::Http {
-            status,
-            path: path.to_string(),
-        });
+        return Err(Error::Http { status, path });
     }
 
     std::fs::create_dir_all(target)?;
@@ -475,13 +483,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    #[test]
-    fn shard_of_is_stable_for_one_shard() {
-        assert_eq!(shard_of("", 1), 0);
-        assert_eq!(shard_of("a.txt", 1), 0);
-        assert_eq!(shard_of("dir/a.txt", 1), 0);
-    }
 
     #[test]
     fn stream_file_content_rejects_partial_body() {

@@ -22,6 +22,68 @@ pub enum Entry {
     },
 }
 
+/// 按相对路径安全打开 root 内的普通文件，返回 fd 与 fstat 大小。
+///
+/// stream-batch 的文件列表来自客户端请求体；这里逐级 `openat(..., O_NOFOLLOW)`，
+/// 避免请求中的路径或竞态出现的符号链接把读取范围带出 root。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
+    let mut dirfd = rfs::openat(
+        rfs::CWD,
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let (parents, file_name) = match rel.rsplit_once('/') {
+        Some((parents, file_name)) => (parents, file_name),
+        None => ("", rel),
+    };
+    if !parents.is_empty() {
+        for component in parents.split('/') {
+            if component.is_empty() {
+                return None;
+            }
+            let child = rfs::openat(
+                &dirfd,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .ok()?;
+            dirfd = child;
+        }
+    }
+    if file_name.is_empty() {
+        return None;
+    }
+    let fd = rfs::openat(
+        &dirfd,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .ok()?;
+    let stat = rfs::fstat(&fd).ok()?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Some((File::from(fd), stat.st_size as u64))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
+    let path = dir.join(rel);
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(dir) {
+        return None;
+    }
+    let file = File::open(canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then(|| (file, metadata.len()))
+}
+
 /// 取目录名作为 zip 内根前缀（也用于 Content-Disposition 文件名）。
 pub fn folder_name(dir: &Path) -> String {
     dir.file_name()
@@ -39,18 +101,6 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
 /// `/stream` 专用遍历：不排序，Linux/Android 直接相对父目录 fd 打开子项。
 pub fn walk_stream(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) {
     walk_stream_inner(dir, prefix, &|_| true, on_entry);
-}
-
-/// `/stream-batch` 专用遍历：文件在打开 fd 前先问 `should_send`。
-///
-/// 目录仍完整遍历；不匹配的文件直接跳过，避免为每个 shard 白付 `openat+fstat`。
-pub fn walk_stream_filtered(
-    dir: &Path,
-    prefix: &str,
-    should_send: &impl Fn(&str) -> bool,
-    on_entry: &mut impl FnMut(Entry) -> bool,
-) {
-    walk_stream_inner(dir, prefix, should_send, on_entry);
 }
 
 /// 按名称排序目录条目，保证 zip 内顺序确定；两个平台的实现共用。

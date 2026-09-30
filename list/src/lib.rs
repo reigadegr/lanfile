@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::File,
     io::{Read as _, Write as _},
     net::TcpStream,
@@ -520,20 +521,6 @@ impl ZipApi {
 const STREAM_DIR: u8 = 0;
 const STREAM_FILE: u8 = 1;
 
-/// 稳定分片哈希：路径字节的 FNV-1a。
-///
-/// 客户端按 manifest 的同一相对路径计算 shard，不能依赖 Rust 默认 Hasher 的跨版本实现。
-#[must_use]
-pub fn shard_of(path: &str, shards: u32) -> u32 {
-    debug_assert!((1..=8).contains(&shards));
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in path.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash % shards
-}
-
 /// 服务端头部缓冲区的大小，也是「小文件直接塞进缓冲区」的上限。
 ///
 /// 头部分（类型字节 + NUL 结尾路径 + 8 字节长度）每条不到一百字节，逐条 `write_all`
@@ -589,17 +576,88 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     serve_stream_inner(socket, root, sub, true, None)
 }
 
-/// 服务 `/stream-batch/<sub>?shard=&shards=`：只发匹配文件的紧凑流。
+/// 服务 `/stream-batch/<sub>?shard=&shards=`：按请求体中的 manifest 索引发文件。
 ///
-/// 目录由客户端根据 manifest 创建，这里不发送目录记录。参数校验由快路径完成。
+/// 目录由客户端根据 manifest 创建，这里不发送目录记录。请求体每条记录为
+/// `路径 NUL + 8 字节小端 size`，服务端不再为 shard 重复遍历目录树。
 pub fn serve_stream_batch(
     socket: &mut TcpStream,
     root: &Path,
     sub: &str,
-    shard: u32,
-    shards: u32,
+    _shard: u32,
+    _shards: u32,
+    body: &[u8],
 ) -> std::io::Result<()> {
-    serve_stream_inner(socket, root, sub, false, Some((shard, shards)))
+    match parse_stream_batch_body(body) {
+        Ok(entries) => serve_stream_inner(socket, root, sub, false, Some(entries)),
+        Err(_) => socket.write_all(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+    }
+}
+
+fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<(String, u64)>> {
+    let invalid =
+        |message: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut offset = 0;
+    while offset < body.len() {
+        let Some(nul) = body[offset..].iter().position(|&byte| byte == 0) else {
+            return Err(invalid("stream-batch 路径缺少 NUL"));
+        };
+        let path_end = offset + nul;
+        let path = std::str::from_utf8(&body[offset..path_end])
+            .map_err(|_| invalid("stream-batch 路径不是 UTF-8"))?;
+        if path.is_empty()
+            || path.len() > 8192
+            || path.starts_with('/')
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || component == "..")
+        {
+            return Err(invalid("stream-batch 路径非法"));
+        }
+        let size_start = path_end + 1;
+        let Some(size_end) = size_start.checked_add(8) else {
+            return Err(invalid("stream-batch 缺少文件大小"));
+        };
+        if size_end > body.len() {
+            return Err(invalid("stream-batch 缺少文件大小"));
+        }
+        let mut size_bytes = [0_u8; 8];
+        size_bytes.copy_from_slice(&body[size_start..size_end]);
+        let size = u64::from_le_bytes(size_bytes);
+        if !seen.insert(path.to_owned()) {
+            return Err(invalid("stream-batch 路径重复"));
+        }
+        entries.push((path.to_owned(), size));
+        offset = size_end;
+    }
+    Ok(entries)
+}
+
+fn send_batch_entries(
+    target: &Path,
+    entries: &[(String, u64)],
+    entry_tx: &mpsc::SyncSender<zip::Entry>,
+) {
+    for (rel, _) in entries {
+        let Some((file, size)) = zip::open_file_under(target, rel) else {
+            continue;
+        };
+        let entry = zip::Entry::File {
+            file,
+            size,
+            name: rel.clone(),
+        };
+        if entry_tx.send(entry).is_err() {
+            break;
+        }
+    }
 }
 
 fn serve_stream_inner(
@@ -607,7 +665,7 @@ fn serve_stream_inner(
     root: &Path,
     sub: &str,
     send_dirs: bool,
-    shard: Option<(u32, u32)>,
+    batch: Option<Vec<(String, u64)>>,
 ) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
@@ -694,17 +752,13 @@ fn serve_stream_inner(
 
     let (entry_tx, entry_rx) = mpsc::sync_channel(STREAM_ENTRY_QUEUE);
     let producer_panicked = thread::scope(|scope| {
-        let producer = scope.spawn(move || match shard {
-            Some((shard, shards)) => zip::walk_stream_filtered(
-                &target,
-                "",
-                &|name: &str| {
-                    let rel = name.trim_start_matches('/');
-                    shard_of(rel, shards) == shard
-                },
-                &mut |entry| entry_tx.send(entry).is_ok(),
-            ),
-            None => zip::walk_stream(&target, "", &mut |entry| entry_tx.send(entry).is_ok()),
+        let producer = scope.spawn(move || {
+            if let Some(entries) = batch {
+                send_batch_entries(&target, &entries, &entry_tx);
+            } else {
+                zip::walk_stream(&target, "", &mut |entry| entry_tx.send(entry).is_ok());
+            }
+            true
         });
 
         while let Ok(entry) = entry_rx.recv() {
@@ -942,17 +996,35 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{Item, ZIP_QUEUE, send_file_chunks, shard_of};
+    use super::{Item, ZIP_QUEUE, parse_stream_batch_body, send_file_chunks};
 
     const FILE_SIZE: usize = 64 * 1024 * 1024;
 
     #[test]
-    fn shard_of_keeps_paths_stable() {
-        assert_eq!(shard_of("", 1), 0);
-        assert_eq!(shard_of("a.txt", 1), 0);
-        let shard = shard_of("dir/a.txt", 4);
-        assert!(shard < 4);
-        assert_eq!(shard_of("dir/a.txt", 4), shard);
+    fn parse_stream_batch_body_accepts_compact_entries() {
+        let mut body = Vec::new();
+        for (path, size) in [("a.txt", 3_u64), ("dir/b.bin", 9)] {
+            body.extend_from_slice(path.as_bytes());
+            body.push(0);
+            body.extend_from_slice(&size.to_le_bytes());
+        }
+
+        assert_eq!(
+            parse_stream_batch_body(&body).unwrap(),
+            [("a.txt".to_owned(), 3), ("dir/b.bin".to_owned(), 9)]
+        );
+    }
+
+    #[test]
+    fn parse_stream_batch_body_rejects_bad_entries() {
+        for body in [
+            &b"a.txt"[..],
+            &b"/a.txt\0\0\0\0\0\0\0\0"[..],
+            &b"../a.txt\0\0\0\0\0\0\0\0"[..],
+            &b"a.txt\0\0\0\0\0\0\0\0a.txt\0\0\0\0\0\0\0\0"[..],
+        ] {
+            assert!(parse_stream_batch_body(body).is_err());
+        }
     }
 
     /// 复刻流水线的读取侧：阻塞线程分块读文件 → 有界 channel → 异步侧消费并归还缓冲。
