@@ -577,14 +577,13 @@ pub fn serve_stream_batch(
     }
 }
 
-fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
+fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<HashSet<String>> {
     let invalid =
         |message: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
     if body.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashSet::new());
     }
-    let mut entries = Vec::new();
-    let mut seen = HashSet::new();
+    let mut entries = HashSet::new();
     let mut offset = 0;
     while offset < body.len() {
         let Some(nul) = body[offset..].iter().position(|&byte| byte == 0) else {
@@ -602,16 +601,19 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
         {
             return Err(invalid("stream-batch 路径非法"));
         }
-        if !seen.insert(path.to_owned()) {
+        if !entries.insert(path.to_owned()) {
             return Err(invalid("stream-batch 路径重复"));
         }
-        entries.push(path.to_owned());
         offset = path_end + 1;
     }
     Ok(entries)
 }
 
-fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<zip::Entry>) {
+fn send_batch_entries(
+    target: &Path,
+    entries: &HashSet<String>,
+    entry_tx: &mpsc::SyncSender<zip::Entry>,
+) {
     for rel in entries {
         let Some((file, size)) = zip::open_file_under(target, rel) else {
             continue;
@@ -631,7 +633,7 @@ fn serve_stream_batch_inner(
     socket: &mut TcpStream,
     root: &Path,
     sub: &str,
-    entries: &[String],
+    entries: &HashSet<String>,
 ) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
@@ -746,7 +748,7 @@ fn serve_stream_batch_inner(
 /// 文件系统不支持 `sendfile`（fuse 类挂载等会回 `EINVAL`）时也回退到这里。
 ///
 /// 用 `pread`（Unix）/ `try_clone` + `seek`（其他）读文件，不动共享的文件偏移量：
-/// `/stream` 的 fd 是 `openat` 拿到的，可能还有其他引用；移动偏移量会互相干扰。
+/// `/stream-batch` 的 fd 是 `openat` 拿到的，可能还有其他引用；移动偏移量会互相干扰。
 fn copy_user(
     mut socket: &TcpStream,
     file: &File,
@@ -793,7 +795,7 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
 /// 编译期：非 Linux/Android 直接走 [`copy_user`]。
 /// 运行时：Linux/Android 上若 `sendfile` 因为文件系统不支持而回 `EINVAL`/`ENOSYS`/
 /// `EOPNOTSUPP`，已经搬走的字节数保留在 `offset` 里，剩下的交给 [`copy_user`] 继续——
-/// 这样即便根目录挂在 fuse 上，`/stream` 也不会中途断连。
+/// 这样即便根目录挂在 fuse 上，`/stream-batch` 也不会中途断连。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<()> {
     let mut offset = 0_u64;
@@ -944,7 +946,7 @@ pub fn list_routes(root: PathBuf, port: u16) -> Router {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::{fs::File, io::Write as _, path::Path, time::Instant};
+    use std::{collections::HashSet, fs::File, io::Write as _, path::Path, time::Instant};
 
     use tokio::sync::mpsc;
 
@@ -962,7 +964,7 @@ mod tests {
 
         assert_eq!(
             parse_stream_batch_body(&body).unwrap(),
-            ["a.txt".to_owned(), "dir/b.bin".to_owned()]
+            HashSet::from(["a.txt".to_owned(), "dir/b.bin".to_owned()])
         );
     }
 
