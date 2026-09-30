@@ -515,10 +515,9 @@ impl ZipApi {
     }
 }
 
-// ---- /stream：走快路径的整树流式端点，正文 sendfile(2) ----
+// ---- /stream-batch：走快路径的清单分片流端点，正文 sendfile(2) ----
 
-/// 协议标记：目录 0 / 文件 1，路径以 NUL 结尾，文件随后跟 8 字节小端长度 + 正文。
-const STREAM_DIR: u8 = 0;
+/// 协议标记：文件 1，路径以 NUL 结尾，随后跟 8 字节小端长度 + 正文。
 const STREAM_FILE: u8 = 1;
 
 /// 服务端头部缓冲区的大小，也是「小文件直接塞进缓冲区」的上限。
@@ -543,7 +542,7 @@ const STREAM_ENTRY_QUEUE: usize = 64;
 
 /// 从文件开头读满 `buf`，不改动文件偏移量（Unix 用 `pread`，非 Unix 复制 fd 后用 `seek`）。
 ///
-/// `/stream` 的小文件走这里：`openat(dirfd, ...)` 拿到的 fd 是共享给 `sendfile` 的，
+/// `/stream-batch` 的小文件走这里：`openat(dirfd, ...)` 拿到的 fd 是共享给 `sendfile` 的，
 /// 用 `pread` 读不会移动偏移量；非 Unix 没有 `pread`，复制一份 fd 后 `seek` 到 0 再读。
 fn read_file_prefix(file: &File, buf: &mut [u8]) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -560,22 +559,6 @@ fn read_file_prefix(file: &File, buf: &mut [u8]) -> std::io::Result<()> {
     }
 }
 
-/// 服务 `/stream/<sub>`：把整棵子树流成紧凑格式，文件正文用 `sendfile(2)` 零拷贝。
-///
-/// 调用方（`app/src/fast.rs` 的 accept 分流）已经读过请求行、解析出路径；本函数
-/// 负责写响应头、遍历、逐条发送。响应不带 `Content-Length`，靠 `Connection: close`
-/// 后的 EOF 结束。
-///
-/// 遍历/打开文件放在一条生产线程上，当前线程只负责组头与写出；两边用有界队列相接，
-/// 元数据遍历可以和网络发送重叠，队列满时生产自然停下来。
-///
-/// 小文件（< [`SENDFILE_THRESHOLD`]）的内容读进 [`STREAM_BUF`]，与头部一起一次写出；
-/// 大文件先 flush 头部缓冲，正文交给 `sendfile` 直发。这样每棵树的 `write` 系统调用
-/// 数由条目数降到「每 64 KiB 一次」，而大文件的正文仍然完全走内核零拷贝。
-pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::Result<()> {
-    serve_stream_inner(socket, root, sub, true, None)
-}
-
 /// 服务 `/stream-batch/<sub>`：按请求体中的 manifest 索引发文件。
 ///
 /// 目录由客户端根据 manifest 创建，这里不发送目录记录。请求体每条记录为
@@ -587,7 +570,7 @@ pub fn serve_stream_batch(
     body: &[u8],
 ) -> std::io::Result<()> {
     match parse_stream_batch_body(body) {
-        Ok(entries) => serve_stream_inner(socket, root, sub, false, Some(entries)),
+        Ok(entries) => serve_stream_batch_inner(socket, root, sub, &entries),
         Err(_) => socket.write_all(
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ),
@@ -644,12 +627,11 @@ fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSe
     }
 }
 
-fn serve_stream_inner(
+fn serve_stream_batch_inner(
     socket: &mut TcpStream,
     root: &Path,
     sub: &str,
-    send_dirs: bool,
-    batch: Option<Vec<String>>,
+    entries: &[String],
 ) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
@@ -663,10 +645,9 @@ fn serve_stream_inner(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
     )?;
 
-    // 遍历线程把已打开的条目交过来；发送回调出错时返回 `false` 并退出接收循环。
+    // 生产线程把已打开的文件交过来；发送回调出错时返回 `false` 并退出接收循环。
     let mut error: Option<std::io::Error> = None;
-    // 头 + 小文件内容的攒批缓冲。它同时服务两类条目：目录头只有几十字节，
-    // 攒下来减少系统调用；小于阈值的小文件内容也读进来，跟头一起写出。
+    // 头 + 小文件内容的攒批缓冲。小于阈值的小文件内容也读进来，跟头一起写出。
     let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
 
     let mut send_entry = |entry| {
@@ -675,24 +656,13 @@ fn serve_stream_inner(
         }
         // 内层闭包返回 `Result`，`?` 就能用了
         let result: std::io::Result<()> = (|| {
-            // 缓冲区够大就先刷一次：即使条目都是长路径或大目录，它也不会无界增长
+            // 缓冲区够大就先刷一次：即使条目都是长路径，它也不会无界增长
             if head_buf.len() >= STREAM_BUF / 2 {
                 socket.write_all(&head_buf)?;
                 head_buf.clear();
             }
 
             match entry {
-                zip::Entry::Dir { name } if send_dirs => {
-                    // walk 给的 name 形如 `/sub/`；剥掉首尾斜杠即相对路径，根目录条目为空跳过
-                    let rel = name.trim_start_matches('/').trim_end_matches('/');
-                    if rel.is_empty() {
-                        // 根目录条目自身不发出
-                        return Ok(());
-                    }
-                    head_buf.push(STREAM_DIR);
-                    head_buf.extend_from_slice(rel.as_bytes());
-                    head_buf.push(0);
-                }
                 zip::Entry::Dir { .. } => {}
                 zip::Entry::File { file, size, name } => {
                     let rel = name.trim_start_matches('/');
@@ -715,7 +685,7 @@ fn serve_stream_inner(
                         }
                     } else {
                         // 大文件：头部先出去，正文交给 sendfile。
-                        // 先刷头部能保证 `Content-Length` 那 8 字节跟头部分一起落到
+                        // 先刷头部能保证长度那 8 字节跟头部分一起落到
                         // 对端缓冲，不会跟随后的 sendfile 抢一个 MSS 段。
                         socket.write_all(&head_buf)?;
                         head_buf.clear();
@@ -737,11 +707,7 @@ fn serve_stream_inner(
     let (entry_tx, entry_rx) = mpsc::sync_channel(STREAM_ENTRY_QUEUE);
     let producer_panicked = thread::scope(|scope| {
         let producer = scope.spawn(move || {
-            if let Some(entries) = batch {
-                send_batch_entries(&target, &entries, &entry_tx);
-            } else {
-                zip::walk_stream(&target, "", &mut |entry| entry_tx.send(entry).is_ok());
-            }
+            send_batch_entries(&target, entries, &entry_tx);
             true
         });
 
@@ -750,12 +716,14 @@ fn serve_stream_inner(
                 break;
             }
         }
-        // 先丢掉接收端，阻塞在 send 上的遍历线程才能拿到错误并停止。
+        // 先丢掉接收端，阻塞在 send 上的生产线程才能拿到错误并停止。
         drop(entry_rx);
         producer.join().is_err()
     });
     if producer_panicked && error.is_none() {
-        error = Some(std::io::Error::other("stream traversal thread panicked"));
+        error = Some(std::io::Error::other(
+            "stream-batch producer thread panicked",
+        ));
     }
 
     // 收尾：把缓冲区里最后那点没写出去的头/内容刷出去

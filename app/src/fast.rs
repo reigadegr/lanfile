@@ -1,4 +1,4 @@
-//! `/files`、`/pull`、`/stream`、`/stream-batch` 的 hyper 快路径。
+//! `/files`、`/pull`、`/stream-batch` 的 hyper 快路径。
 //!
 //! salvo 的 `HyperHandler` 每请求要做一整套：按 `Host` 重建 `Uri`、往 `Extensions` 里插
 //! `ConnCtrl`、把路径 `to_owned`、构造 `PathState`、跑一遍路由匹配、重建 handler 链
@@ -11,8 +11,8 @@
 //! `dyn Handler`，不装箱），其余路径原样交给 salvo 的 `HyperHandler`。HTTP/1 的配置直接
 //! 用 salvo 的 [`HttpBuilder::new`]——`Server::new` 用的就是它，所以连接层行为与原来完全一致。
 //!
-//! `/stream` 走得更远：accept 后先 `peek` 一眼请求行，命中就完全绕开 hyper，
-//! 直接往 socket 写响应头、遍历目录、逐文件 `sendfile(2)`。
+//! `/stream-batch` 走得更远：accept 后先 `peek` 一眼请求行，命中就完全绕开 hyper，
+//! 直接往 socket 写响应头、按请求体索引逐文件 `sendfile(2)`。
 //! HTTP/1.1 下这是吃上 `sendfile` 的唯一方式：只要经过 hyper 的 body，
 //! 无 `Content-Length` 就会走 chunked 分帧，零拷贝无从谈起。
 
@@ -175,34 +175,35 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
 
 /// accept 出错后的退避时间，取值与 salvo 的 `Server` 一致。
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+const STREAM_BATCH_PREFIX: &str = "/stream-batch/";
 const MAX_STREAM_BATCH_BODY: usize = 64 * 1024 * 1024;
 
-/// 看一眼请求行是不是 `/stream/...`。
+/// 看请求行是不是 `/stream-batch/...`。
 ///
 /// 用 `peek` 不消耗 socket 缓冲；是就交给自定义处理，否则原样交回给 hyper。
 /// 带超时，避免客户端连上却不发请求时卡住 accept 循环。
-async fn peek_stream_prefix(conn: &tokio::net::TcpStream) -> Option<&'static str> {
+async fn is_stream_batch_request(conn: &tokio::net::TcpStream) -> bool {
     let mut buf = [0_u8; 1024];
     let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), conn.peek(&mut buf)).await
     else {
-        return None;
+        return false;
     };
-    let line_end = buf[..n].windows(2).position(|w| w == b"\r\n")?;
+    let Some(line_end) = buf[..n].windows(2).position(|w| w == b"\r\n") else {
+        return false;
+    };
     let line = &buf[..line_end];
-    // GET /stream/... HTTP/1.1
-    let space1 = line.iter().position(|&b| b == b' ')?;
+    // GET /stream-batch/... HTTP/1.1
+    let Some(space1) = line.iter().position(|&b| b == b' ') else {
+        return false;
+    };
     let rest = &line[space1 + 1..];
-    let space2 = rest.iter().position(|&b| b == b' ')?;
-    if rest[..space2].starts_with(b"/stream-batch/") {
-        Some("/stream-batch/")
-    } else if rest[..space2].starts_with(b"/stream/") {
-        Some("/stream/")
-    } else {
-        None
-    }
+    let Some(space2) = rest.iter().position(|&b| b == b' ') else {
+        return false;
+    };
+    rest[..space2].starts_with(STREAM_BATCH_PREFIX.as_bytes())
 }
 
-/// 处理一条 `/stream/` 连接：读请求头、解析路径、交给阻塞线程跑同步 sendfile 流程。
+/// 处理一条 `/stream-batch/` 连接：读请求头、解析路径、读请求体并发送文件。
 async fn handle_stream_connection(
     conn: tokio::net::TcpStream,
     root: Arc<PathBuf>,
@@ -247,26 +248,16 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     };
     let path = std::str::from_utf8(&rest[..space2])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "请求路径不是 UTF-8"))?;
-    let is_batch = path.starts_with("/stream-batch/");
-    let prefix = if is_batch {
-        "/stream-batch/"
-    } else {
-        "/stream/"
-    };
-    let Some(encoded_target) = path.strip_prefix(prefix) else {
+    let Some(encoded_target) = path.strip_prefix(STREAM_BATCH_PREFIX) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "路径不是 stream 端点",
+            "路径不是 stream-batch 端点",
         ));
     };
 
     let decoded = decode_url_path(encoded_target);
-    if is_batch {
-        let body = read_request_body(&mut stream, &head)?;
-        lanfile_list::serve_stream_batch(&mut stream, root, &decoded, &body)
-    } else {
-        lanfile_list::serve_stream(&mut stream, root, &decoded)
-    }
+    let body = read_request_body(&mut stream, &head)?;
+    lanfile_list::serve_stream_batch(&mut stream, root, &decoded, &body)
 }
 
 fn read_request_body(stream: &mut StdTcpStream, head: &[u8]) -> io::Result<Vec<u8>> {
@@ -342,12 +333,12 @@ pub async fn serve(
             tracing::debug!(error = ?error, "设置 TCP_NODELAY 失败");
         }
 
-        // /stream 分流：peek 一眼请求行，命中就完全绕开 hyper
-        if peek_stream_prefix(&conn).await.is_some() {
+        // /stream-batch 分流：peek 一眼请求行，命中就完全绕开 hyper
+        if is_stream_batch_request(&conn).await {
             let root = Arc::clone(&root);
             tokio::spawn(async move {
                 if let Err(error) = handle_stream_connection(conn, root).await {
-                    tracing::debug!("stream 连接出错: {error}");
+                    tracing::debug!("stream-batch 连接出错: {error}");
                 }
             });
             continue;
@@ -410,7 +401,7 @@ mod tests {
         assert!(route_path("/files").is_none());
         assert!(route_path("/pull").is_none());
         assert!(route_path("/api/list").is_none());
-        assert!(route_path("/stream/foo").is_none()); // stream 走 peek 分流，不进 hyper
+        assert!(route_path("/stream-batch/foo").is_none()); // stream-batch 走 peek 分流，不进 hyper
         assert!(route_path("/static/x.css").is_none());
         assert!(route_path("/").is_none());
     }

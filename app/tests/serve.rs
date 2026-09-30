@@ -1048,6 +1048,18 @@ async fn stream_batch_accepts_empty_index_request() {
     server.abort();
 }
 
+#[tokio::test]
+async fn stream_endpoint_is_removed() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let (head, _) = http_request(addr, "GET", "/stream/a.txt", "").await;
+    assert!(status_line(&head).contains("404"));
+
+    server.abort();
+}
+
 /// 文件夹直链 `http://h/api/zip/<sub>`、`http://h/#<sub>`：当目录整棵拉，落盘语义与
 /// `lanfile get http://h <sub>` 一致（默认套一层）。
 #[tokio::test]

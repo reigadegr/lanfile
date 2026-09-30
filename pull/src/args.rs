@@ -32,7 +32,7 @@ pub enum Kind {
     Dir,
     /// `/files/`、`/pull/` 直链：直接当文件。
     File,
-    /// `/stream/<sub>` 或 `/#<sub>`：清单并发；旧服务端回退单连接流式。
+    /// `/#<sub>`：清单并发。
     Stream,
 }
 
@@ -130,7 +130,7 @@ fn parse_source(url: &str) -> Result<Source, Error> {
 
 /// 认直链，给出 URL 里已经指明的那条远端路径：
 /// - `/files/<sub>`、`/pull/<sub>` 当文件，`/api/zip/<sub>`、`/api/list/<sub>` 当目录；
-/// - `/api/stream/<sub>` 与 `/#<sub>` 走清单并发（旧服务端回退流式）；
+/// - `/#<sub>` 走清单并发；
 /// - 其余非空路径本身就是远端，kind 待探测——`http://h/.pi` 等价于 `lanfile get http://h .pi`；
 /// - 只有空路径（`http://h`、`http://h/`）返回 `None`，remote 留给位置参数。
 fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
@@ -154,19 +154,8 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
             kind: Kind::Dir,
         });
     }
-    // 流式端点：/stream/<sub>，以及旧写法 /api/stream/<sub> 向后兼容。
-    if let Some(sub) = path
-        .strip_prefix("stream/")
-        .or_else(|| path.strip_prefix("api/stream/"))
-        .filter(|sub| !sub.is_empty())
-    {
-        return Some(Direct {
-            remote: percent_decode(sub),
-            kind: Kind::Stream,
-        });
-    }
     // 站内直链 /#<sub>：path 为空（`/`、`/#<sub>`，或没写 `/` 的 `#<sub>`）。`#` 在 `?` 之前时
-    // 用户多写的查询串也算 fragment（`/#sub?x=1`），一并切掉。默认走流式。
+    // 用户多写的查询串也算 fragment（`/#sub?x=1`），一并切掉。默认走清单并发。
     if path.is_empty() {
         let sub = fragment.trim_start_matches('/');
         let sub = sub.split_once('?').map_or(sub, |(sub, _)| sub);
@@ -285,20 +274,6 @@ mod tests {
     fn parse_args_direct_link_strips_query_and_fragment() {
         let p = parse_args(&["http://h:1/files/x.txt?v=1#frag".into()]).unwrap();
         assert_eq!(p.remote, "x.txt");
-    }
-
-    #[test]
-    fn parse_args_stream_direct_link_is_stream() {
-        let p = parse_args(&["http://h:1/stream/a/b".into()]).unwrap();
-        assert_eq!(p.remote, "a/b");
-        assert_eq!(p.kind, Kind::Stream);
-    }
-
-    #[test]
-    fn parse_args_legacy_api_stream_is_stream() {
-        let p = parse_args(&["http://h:1/api/stream/a/b".into()]).unwrap();
-        assert_eq!(p.remote, "a/b");
-        assert_eq!(p.kind, Kind::Stream);
     }
 
     #[test]

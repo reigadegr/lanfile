@@ -1,7 +1,7 @@
-//! 流式下载：一次 HTTP 事务把整棵目录树搬下来，文件正文走 `splice(2)` 零拷贝落盘。
+//! 分片流下载：一条连接按 manifest 索引接收一组文件，正文走 `splice(2)` 零拷贝落盘。
 //!
-//! 服务端 `/stream/<sub>` 边遍历边发，协议：每个条目前 1 字节类型（目录 0 / 文件 1），
-//! 目录只有 NUL 结尾的路径，文件是 NUL 结尾的路径 + 8 字节小端长度 + 正文。响应没有
+//! 服务端 `/stream-batch/<sub>` 只发文件记录：每条为类型 1、NUL 结尾的路径、8 字节小端
+//! 长度、正文。响应没有
 //! `Content-Length`，靠 `Connection: close` 后的 EOF 结束。
 //!
 //! 整条流程在一个阻塞线程里同步执行：同步 socket + 同步文件 IO，不走 `tokio::fs`。
@@ -58,43 +58,7 @@ impl StreamStats {
 
 struct StreamRequest {
     path: String,
-    body: Option<Vec<u8>>,
-}
-
-/// 从 `host` 拉 `remote` 子树到本地 `target`（`target` 已经是落盘根目录，不含 basename 层）。
-pub async fn fetch_stream(host: &str, remote: &str, target: &Path) -> Result<StreamStats, Error> {
-    // 建连留在 async 侧：tokio 的 connect 带超时、走运行时解析器；连上之后整条流程交给
-    // 一个阻塞线程，后面不再有任何 async 边界。
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(host))
-        .await
-        .map_err(|_| Error::Timeout { phase: "连接" })?
-        .map_err(|source| Error::Connect {
-            host: host.to_string(),
-            source,
-        })?;
-    let _ = stream.set_nodelay(true);
-    let stream = stream.into_std()?;
-
-    let host_owned = host.to_string();
-    let remote_owned = remote.to_string();
-    let target_owned = target.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let request = StreamRequest {
-            path: format!("/stream/{}", encode_path(&remote_owned)),
-            body: None,
-        };
-        fetch_stream_blocking(
-            stream,
-            &host_owned,
-            request,
-            &remote_owned,
-            &target_owned,
-            true,
-            None,
-        )
-    })
-    .await
-    .map_err(|join| Error::Io(io::Error::other(join)))?
+    body: Vec<u8>,
 }
 
 pub async fn fetch_stream_shard(
@@ -124,7 +88,7 @@ pub async fn fetch_stream_shard(
     let request_path = format!("/stream-batch/{}", encode_path(remote));
     let request = StreamRequest {
         path: request_path,
-        body: Some(request_body),
+        body: request_body,
     };
     tokio::task::spawn_blocking(move || {
         fetch_stream_blocking(
@@ -133,8 +97,7 @@ pub async fn fetch_stream_shard(
             request,
             &remote_owned,
             &target_owned,
-            false,
-            Some(expected),
+            expected,
         )
     })
     .await
@@ -148,15 +111,14 @@ fn fetch_stream_blocking(
     request: StreamRequest,
     remote: &str,
     target: &Path,
-    accept_dirs: bool,
-    mut expected: Option<HashMap<String, u64>>,
+    mut expected: HashMap<String, u64>,
 ) -> Result<StreamStats, Error> {
     // tokio 的 socket 是非阻塞的，切回阻塞模式才能用同步 IO
     stream.set_nonblocking(false)?;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
-    let body = request.body.unwrap_or_default();
+    let body = request.body;
     let path = request.path;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -201,9 +163,7 @@ fn fetch_stream_blocking(
 
         match kind[0] {
             0 => {
-                check_dir_record(accept_dirs)?;
-                ensure_dir(&target.join(&rel), &mut made_dirs)?;
-                stats.dirs += 1;
+                return Err(Error::Malformed("分片流包含目录记录"));
             }
             1 => {
                 let mut size_buf = [0_u8; 8];
@@ -235,28 +195,11 @@ fn fetch_stream_blocking(
             _ => return Err(Error::Malformed("远端返回了未知的条目类型")),
         }
     }
-    check_missing(expected.as_ref())?;
+    check_missing(&expected)?;
     Ok(stats)
 }
 
-fn check_dir_record(accept_dirs: bool) -> Result<(), Error> {
-    if accept_dirs {
-        return Ok(());
-    }
-    Err(Error::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "分片流不应包含目录记录",
-    )))
-}
-
-fn check_expected(
-    expected: &mut Option<HashMap<String, u64>>,
-    rel: &str,
-    size: u64,
-) -> Result<(), Error> {
-    let Some(expected) = expected.as_mut() else {
-        return Ok(());
-    };
+fn check_expected(expected: &mut HashMap<String, u64>, rel: &str, size: u64) -> Result<(), Error> {
     let want = expected.remove(rel).ok_or_else(|| {
         Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -272,10 +215,10 @@ fn check_expected(
     Ok(())
 }
 
-fn check_missing(expected: Option<&HashMap<String, u64>>) -> Result<(), Error> {
-    let Some(expected) = expected.filter(|expected| !expected.is_empty()) else {
+fn check_missing(expected: &HashMap<String, u64>) -> Result<(), Error> {
+    if expected.is_empty() {
         return Ok(());
-    };
+    }
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!(

@@ -98,103 +98,9 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
     walk_inner(dir, prefix, on_entry);
 }
 
-/// `/stream` 专用遍历：不排序，Linux/Android 直接相对父目录 fd 打开子项。
-pub fn walk_stream(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) {
-    walk_stream_inner(dir, prefix, on_entry);
-}
-
 /// 按名称排序目录条目，保证 zip 内顺序确定；两个平台的实现共用。
 fn sort_by_name<T>(entries: &mut [(T, String)]) {
     entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn walk_stream_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
-    let Ok(dirfd) = rfs::openat(
-        rfs::CWD,
-        dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return true;
-    };
-    if !on_entry(Entry::Dir {
-        name: format!("{prefix}/"),
-    }) {
-        return false;
-    }
-    walk_stream_fd(&dirfd, prefix, on_entry)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn walk_stream_fd(
-    dirfd: &rustix::fd::OwnedFd,
-    prefix: &str,
-    on_entry: &mut impl FnMut(Entry) -> bool,
-) -> bool {
-    let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
-    let mut raw_dir = RawDir::new(dirfd, &mut buf);
-    while let Some(entry) = raw_dir.next() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let name_bytes = entry.file_name().to_bytes();
-        if name_bytes == b"." || name_bytes == b".." {
-            continue;
-        }
-        let name = String::from_utf8_lossy(name_bytes).into_owned();
-        let zip_name = format!("{prefix}/{name}");
-        let reported_ft = entry.file_type();
-        let actual_ft = if reported_ft == FileType::Unknown {
-            rfs::statat(dirfd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
-                .map_or(reported_ft, |s| FileType::from_raw_mode(s.st_mode))
-        } else {
-            reported_ft
-        };
-
-        let keep_going = if actual_ft.is_dir() {
-            let Ok(child) = rfs::openat(
-                dirfd,
-                entry.file_name(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            ) else {
-                continue;
-            };
-            let emitted = on_entry(Entry::Dir {
-                name: format!("{zip_name}/"),
-            });
-            if emitted {
-                walk_stream_fd(&child, &zip_name, on_entry)
-            } else {
-                false
-            }
-        } else if actual_ft.is_file() {
-            let opened = rfs::openat(
-                dirfd,
-                entry.file_name(),
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .ok()
-            .and_then(|fd| rfs::fstat(&fd).ok().map(|stat| (fd, stat)));
-            match opened {
-                Some((fd, stat)) => on_entry(Entry::File {
-                    file: fd.into(),
-                    #[allow(clippy::cast_sign_loss)]
-                    size: stat.st_size as u64,
-                    name: zip_name,
-                }),
-                None => true,
-            }
-        } else {
-            true
-        };
-        if !keep_going {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -331,50 +237,6 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
     true
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn walk_stream_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return true;
-    };
-
-    if !on_entry(Entry::Dir {
-        name: format!("{prefix}/"),
-    }) {
-        return false;
-    }
-
-    for entry in read_dir {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let zip_name = format!("{prefix}/{name}");
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let ft = metadata.file_type();
-        let keep_going = if ft.is_dir() {
-            walk_stream_inner(&path, &zip_name, on_entry)
-        } else if ft.is_file() {
-            match File::open(&path) {
-                Ok(file) => on_entry(Entry::File {
-                    file,
-                    size: metadata.len(),
-                    name: zip_name,
-                }),
-                Err(_) => true,
-            }
-        } else {
-            true
-        };
-        if !keep_going {
-            return false;
-        }
-    }
-    true
-}
-
 /// 生成 RFC 5987 风格的 Content-Disposition 值：filename*=UTF-8''<pct>.zip
 pub fn content_disposition(folder_name: &str) -> String {
     let mut out = String::from("attachment; filename*=UTF-8''");
@@ -408,12 +270,6 @@ mod tests {
         }
         for name in ["c", "d", "e"] {
             std::fs::write(root.join("dir").join(name), "x").unwrap();
-        }
-    }
-
-    fn entry_name(entry: &Entry) -> &str {
-        match entry {
-            Entry::Dir { name } | Entry::File { name, .. } => name,
         }
     }
 
@@ -465,96 +321,6 @@ mod tests {
 
         assert_eq!(count, 4);
 
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn walk_stream_emits_same_entries_without_requiring_sort() {
-        let root = tmp_root("stream-full");
-        let _ = std::fs::remove_dir_all(&root);
-        make_tree(&root);
-
-        let mut walk_entries = Vec::new();
-        walk(&root, "root", &mut |entry| {
-            walk_entries.push(entry_name(&entry).to_owned());
-            true
-        });
-        let mut stream_entries = Vec::new();
-        walk_stream(&root, "root", &mut |entry| {
-            stream_entries.push(entry_name(&entry).to_owned());
-            true
-        });
-        stream_entries.sort_unstable();
-
-        assert_eq!(stream_entries, walk_entries);
-        assert_eq!(stream_entries.first().map(String::as_str), Some("root/"));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn walk_stream_stops_when_callback_returns_false() {
-        let root = tmp_root("stream-stop");
-        let _ = std::fs::remove_dir_all(&root);
-        make_tree(&root);
-
-        let mut count = 0;
-        walk_stream(&root, "root", &mut |_entry| {
-            count += 1;
-            count < 4
-        });
-
-        assert_eq!(count, 4);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn walk_stream_does_not_emit_unopenable_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tmp_root("stream-unopenable");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("closed")).unwrap();
-        std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-        if std::fs::read_dir(root.join("closed")).is_ok() {
-            let _ = std::fs::remove_dir_all(&root);
-            return;
-        }
-
-        let mut names = Vec::new();
-        walk_stream(&root, "root", &mut |entry| {
-            names.push(entry_name(&entry).to_owned());
-            true
-        });
-        std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-
-        assert_eq!(names, vec!["root/"]);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn walk_stream_includes_lossy_names_and_skips_symlinks() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let root = tmp_root("stream-names");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
-        let raw_name = OsStr::from_bytes(b"bad-\xff-name");
-        std::fs::write(root.join(raw_name), "x").unwrap();
-        std::os::unix::fs::symlink("missing", root.join("link")).unwrap();
-
-        let mut names = Vec::new();
-        walk_stream(&root, "root", &mut |entry| {
-            names.push(entry_name(&entry).to_owned());
-            true
-        });
-
-        assert_eq!(names, vec!["root/", "root/bad-\u{fffd}-name"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -6,17 +6,16 @@
 //!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
 //! - 直链：URL 的路径或 fragment 直接指明远端——`http://h/files/<sub>`、`http://h/pull/<sub>`
 //!   当文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录，
-//!   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走清单并发模式（旧服务端回退流式），
+//!   `http://h/#<sub>` 走清单并发模式，
 //!   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、文件还是目录交给 `/api/list` 探测。
 //!
 //! 服务端三个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
 //! - `/pull/<sub>` 逐个文件落盘（逐个拉取时用）；
-//! - `/api/manifest/<sub>` 把整棵子树的元数据一次交给客户端（清单模式用）；
-//! - `/stream/<sub>` 把整棵子树流成紧凑格式（旧服务端兼容模式用，一次事务）。
+//! - `/api/manifest/<sub>` 把整棵子树的元数据一次交给客户端（清单模式用）。
 //!
 //! 清单模式：先一次取整棵树的元数据，再并发拉正文。目录展开只需一个请求，文件下载
-//! 可重叠等待。旧服务端没有 manifest 端点时回退单连接流式。
+//! 可重叠等待。
 //!
 //! 并发拉取（逐个/清单模式）：文件各起一个任务，用
 //! `buffer_unordered(DOWNLOAD_CONCURRENCY)` 限制同时在飞的任务数。目录递归保持串行——
@@ -30,7 +29,7 @@
 //! 哑掉不会把客户端挂死；复用的连接若被对端悄悄关掉，下一次请求会换一条新连接重试一次。
 //! 正文在 Linux/Android 且目标文件系统支持时走 `splice(2)` 零拷贝落盘，其余平台或文件系统
 //! 退回用户态读写，落盘内容与截断判定两边一致。结构上每个文件的抓取收口在 [`fetch_file`]、
-//! 目录枚举收口在 [`list_entries`]、整树流式收口在 [`streaming::fetch_stream`]。
+//! 目录枚举收口在 [`list_entries`]、清单分片流收口在 [`streaming::fetch_stream_shard`]。
 
 mod args;
 mod error;
@@ -74,7 +73,7 @@ const STREAM_TASK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 ///   直接报错；给了名字则先试目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉。
 /// - 直链（URL 的路径/fragment 已指明远端）：`http://h/files/<sub>`、`http://h/pull/<sub>` 当
 ///   文件；`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录（逐个拉）；
-///   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走清单并发（旧服务端回退流式）；
+///   `http://h/#<sub>` 走清单并发；
 ///   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、kind 交给 `/api/list` 探测；
 ///   不给 `local` 则落进当前目录（文件取末段为名）。
 ///
@@ -85,7 +84,7 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
     let pool = Pool::default();
     match p.kind {
-        // 清单直链：一次取元数据，然后并发拉正文；旧服务端回退单连接流式。
+        // 清单直链：一次取元数据，然后并发拉正文。
         Kind::Stream => run_manifest(&pool, &p).await,
         // 直链已指明 kind：文件直接拉、目录当目录拉。
         Kind::File => run_file(&pool, &p).await,
@@ -166,15 +165,9 @@ fn to_not_found(error: Error, remote: &str) -> Error {
 }
 
 /// 清单模式：一次取 manifest，目录先建好，文件按目录亲和分片并发拉。
-///
-/// 旧服务端没有 manifest 端点时回退到原单连接流式，保持新旧版本可以互通。
 async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
     let target = local_target(&p.local, &p.remote, p.flat);
-    let entries = match fetch_manifest(pool, &p.host, &p.remote).await {
-        Ok(entries) => entries,
-        Err(Error::Http { status: 404, .. }) => return run_stream(p).await,
-        Err(error) => return Err(error.into()),
-    };
+    let entries = fetch_manifest(pool, &p.host, &p.remote).await?;
     let (mut stats, files) = prepare_manifest(&target, &entries).await?;
     let stream_stats = pull_stream_shards(&p.host, &p.remote, &target, files).await?;
     stats.files = stream_stats.files;
@@ -193,22 +186,6 @@ async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
         stats.skipped,
     );
     stats.via.report();
-    Ok(())
-}
-
-/// 流式模式：一次 `GET /stream/<remote>` 把整棵树拉下来。
-async fn run_stream(p: &Parsed) -> Result<(), BoxError> {
-    let target = local_target(&p.local, &p.remote, p.flat);
-    let stats = streaming::fetch_stream(&p.host, &p.remote, &target).await?;
-    eprintln!(
-        "lanfile get: {}/{} -> {}（流式：{} 文件，{} 目录，{} 字节）",
-        p.base,
-        p.remote,
-        target.display(),
-        stats.files,
-        stats.dirs,
-        stats.bytes,
-    );
     Ok(())
 }
 
