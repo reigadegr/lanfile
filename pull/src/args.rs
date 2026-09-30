@@ -52,7 +52,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, Error> {
         };
         (direct.remote, direct.kind, local)
     } else {
-        // 裸 host：[remote] [local]；remote 缺省即拉根。
+        // 裸 host：[remote] [local]；remote 为空会在下面统一拒绝。
         if pos.len() > 2 {
             return Err(Error::Malformed(USAGE));
         }
@@ -167,9 +167,8 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
         }
         return None;
     }
-    // 其余非空路径本身就是远端，是文件还是目录留给 `/api/list` 探测。早先这里返回 `None`
-    // 退回裸 host、remote 缺省为空＝拉根，于是 `http://h/.pi` 这样最自然的写法会默默
-    // 退成拉根（拉根现已禁、会直接报错，但把路径认成远端仍是正解，不能丢）。
+    // 其余非空路径本身就是远端，是文件还是目录留给 `/api/list` 探测。
+    // 不能把这类路径退回裸 host：那会把用户指定的子树误解释成拉根请求。
     let sub = path.trim_matches('/');
     if sub.is_empty() {
         return None;
@@ -188,7 +187,7 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && i + 2 < bytes.len()
+            && i + 2 <= bytes.len()
             && let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
         {
             out.push(hi << 4 | lo);
@@ -383,6 +382,7 @@ mod tests {
         assert_eq!(percent_decode("boards.md"), "boards.md");
         assert_eq!(percent_decode("a%20b.txt"), "a b.txt");
         assert_eq!(percent_decode("%E4%B8%AD"), "中");
+        assert_eq!(percent_decode("boards.md%20"), "boards.md ");
         // 非法 %XX 原样保留
         assert_eq!(percent_decode("a%2z.txt"), "a%2z.txt");
     }
