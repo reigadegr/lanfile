@@ -6,19 +6,19 @@
 //!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
 //! - 直链：URL 的路径或 fragment 直接指明远端——`http://h/files/<sub>`、`http://h/pull/<sub>`
 //!   当文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录，
-//!   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走流式（一次请求整棵树），
+//!   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走清单并发模式（旧服务端回退流式），
 //!   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、文件还是目录交给 `/api/list` 探测。
 //!
 //! 服务端三个 GET 端点：
 //! - `/api/list/<dir>` 拿到一层目录的条目（name/type/size）；
 //! - `/pull/<sub>` 逐个文件落盘（逐个拉取时用）；
-//! - `/api/stream/<sub>` 把整棵子树流成紧凑格式（流式模式用，一次事务）。
+//! - `/api/manifest/<sub>` 把整棵子树的元数据一次交给客户端（清单模式用）；
+//! - `/stream/<sub>` 把整棵子树流成紧凑格式（旧服务端兼容模式用，一次事务）。
 //!
-//! 流式模式：客户端一次请求，服务端边遍历边发，事务数从 2N 降到 1，回环与局域网上
-//! 每次事务的固定开销不再随文件数累加。逐个拉取模式保留：`/api/list` 与 `/api/zip`
-//! 直链仍按原路径走（兼容既有脚本），`--flat` 语义两边一致。
+//! 清单模式：先一次取整棵树的元数据，再并发拉正文。目录展开只需一个请求，文件下载
+//! 可重叠等待。旧服务端没有 manifest 端点时回退单连接流式。
 //!
-//! 并发拉取（逐个拉取模式）：同一层目录里的文件各起一个任务，用
+//! 并发拉取（逐个/清单模式）：文件各起一个任务，用
 //! `buffer_unordered(DOWNLOAD_CONCURRENCY)` 限制同时在飞的任务数。目录递归保持串行——
 //! 树是流式处理的，先把目录攒起来再并发会让整棵树的展开碎掉、内存上界也失控；同层文件并发
 //! 已经能吃满客户端的多核。连接池 [`Pool`] 内部有锁，每个任务各借一条连接，互不影响。
@@ -43,18 +43,19 @@ mod streaming;
 pub use error::{BoxError, Error};
 
 use crate::args::{Kind, Parsed, parse_args};
-use crate::fetch::{Fetched, RemoteEntry, Via, fetch_file, list_entries};
+use crate::fetch::{
+    Fetched, ManifestEntry, RemoteEntry, Via, fetch_file, fetch_manifest, list_entries,
+};
 use crate::http::Pool;
 use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 
-/// 同层目录里同时在飞的文件任务数（逐个拉取模式）。
+/// 同时在飞的文件任务数（逐个/清单模式）。
 ///
 /// 客户端与服务端都在本机、服务端几乎不占 CPU 时，串行拉取被逐个文件的往返时延卡住；
 /// 8 路并发把等待重叠起来，同时不会让服务端的 `FileCache` 分片锁或客户端磁盘写成为瓶颈。
 /// 一个文件一个连接，pool 的容量由这个数自然定住。
 ///
-/// 流式模式（`Kind::Stream`）不走这条路径，因此这个常量对最常见的 `#<sub>` 直链无影响。
 const DOWNLOAD_CONCURRENCY: usize = 8;
 
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
@@ -64,7 +65,7 @@ const DOWNLOAD_CONCURRENCY: usize = 8;
 ///   直接报错；给了名字则先试目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉。
 /// - 直链（URL 的路径/fragment 已指明远端）：`http://h/files/<sub>`、`http://h/pull/<sub>` 当
 ///   文件；`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录（逐个拉）；
-///   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走流式（一次请求整棵树）；
+///   `http://h/api/stream/<sub>` 与 `http://h/#<sub>` 走清单并发（旧服务端回退流式）；
 ///   其余非空路径（`http://h/<sub>`，如 `/.pi`）就是远端本身、kind 交给 `/api/list` 探测；
 ///   不给 `local` 则落进当前目录（文件取末段为名）。
 ///
@@ -75,8 +76,8 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let p = parse_args(args)?;
     let pool = Pool::default();
     match p.kind {
-        // 流式：不借池、不并发，一条连接把整棵树收下来。
-        Kind::Stream => run_stream(&p).await,
+        // 清单直链：一次取元数据，然后并发拉正文；旧服务端回退单连接流式。
+        Kind::Stream => run_manifest(&pool, &p).await,
         // 直链已指明 kind：文件直接拉、目录当目录拉。
         Kind::File => run_file(&pool, &p).await,
         Kind::Dir => run_dir(&pool, &p, false).await,
@@ -155,7 +156,32 @@ fn to_not_found(error: Error, remote: &str) -> Error {
     }
 }
 
-/// 流式模式：一次 `GET /api/stream/<remote>` 把整棵树拉下来。
+/// 清单模式：一次取 manifest，目录先建好，文件并发拉。
+///
+/// 旧服务端没有 manifest 端点时回退到原单连接流式，保持新旧版本可以互通。
+async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
+    let target = local_target(&p.local, &p.remote, p.flat);
+    let entries = match fetch_manifest(pool, &p.host, &p.remote).await {
+        Ok(entries) => entries,
+        Err(Error::Http { status: 404, .. }) => return run_stream(p).await,
+        Err(error) => return Err(error.into()),
+    };
+    let stats = pull_manifest(pool, &p.host, &p.remote, &target, entries).await?;
+    eprintln!(
+        "lanfile get: {}/{} -> {}（清单并发：{} 文件，{} 目录，{} 字节，跳过已存在 {} 个）",
+        p.base,
+        p.remote,
+        target.display(),
+        stats.files,
+        stats.dirs,
+        stats.bytes,
+        stats.skipped,
+    );
+    stats.via.report();
+    Ok(())
+}
+
+/// 流式模式：一次 `GET /stream/<remote>` 把整棵树拉下来。
 async fn run_stream(p: &Parsed) -> Result<(), BoxError> {
     let target = local_target(&p.local, &p.remote, p.flat);
     let stats = streaming::fetch_stream(&p.host, &p.remote, &target).await?;
@@ -344,6 +370,61 @@ async fn pull_entries(
         stats.via.merge(&sub.via);
     }
 
+    Ok(stats)
+}
+
+/// 按 manifest 落盘：目录先全建好（包括空目录），文件再并发抓。
+async fn pull_manifest(
+    pool: &Pool,
+    host: &str,
+    remote: &str,
+    local: &Path,
+    entries: Vec<ManifestEntry>,
+) -> Result<Stats, Error> {
+    tokio::fs::create_dir_all(local).await?;
+    let mut stats = Stats::default();
+    let mut file_tasks = Vec::new();
+
+    for entry in entries {
+        let local_child = local.join(&entry.path);
+        if entry.is_dir() {
+            tokio::fs::create_dir_all(&local_child).await?;
+            stats.dirs += 1;
+            continue;
+        }
+
+        stats.files += 1;
+        let remote_child = if remote.is_empty() {
+            entry.path.clone()
+        } else {
+            format!("{remote}/{}", entry.path)
+        };
+        let remote_size = entry.size;
+        file_tasks.push(async move {
+            if skip_existing(&local_child, remote_size).await {
+                return FileOutcome::Skipped;
+            }
+            match fetch_file(pool, host, &remote_child, &local_child).await {
+                Ok(fetched) => FileOutcome::Fetched(fetched),
+                Err(error) => FileOutcome::Failed(remote_child, error),
+            }
+        });
+    }
+
+    let outcomes = stream::iter(file_tasks)
+        .buffer_unordered(DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for outcome in outcomes {
+        match outcome {
+            FileOutcome::Skipped => stats.skipped += 1,
+            FileOutcome::Fetched(fetched) => {
+                stats.bytes += fetched.bytes;
+                stats.via.record(fetched.via);
+            }
+            FileOutcome::Failed(name, error) => eprintln!("  跳过 {name}：{error}"),
+        }
+    }
     Ok(stats)
 }
 

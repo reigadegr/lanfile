@@ -51,6 +51,19 @@ struct ListResponse {
     entries: Vec<ListEntry>,
 }
 
+#[derive(Serialize)]
+struct ManifestEntry {
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: &'static str,
+    size: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ManifestResponse {
+    entries: Vec<ManifestEntry>,
+}
+
 struct ListApi {
     root: PathBuf,
     port: u16,
@@ -255,6 +268,41 @@ fn list_directory(root: &Path, path: &str) -> Option<Vec<ListEntry>> {
     Some(list_entries)
 }
 
+/// 递归收集整棵树的元数据，不打开文件正文。
+fn manifest_directory(root: &Path, path: &str) -> Option<Vec<ManifestEntry>> {
+    let dir = resolve_under(root, path)?;
+    let mut entries = Vec::new();
+    collect_manifest(&dir, "", &mut entries)?;
+    Some(entries)
+}
+
+fn collect_manifest(dir: &Path, prefix: &str, entries: &mut Vec<ManifestEntry>) -> Option<()> {
+    raw_dir_entries(dir, |entry| {
+        let path = if prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{prefix}/{}", entry.name)
+        };
+        if entry.is_dir {
+            entries.push(ManifestEntry {
+                path: path.clone(),
+                entry_type: "dir",
+                size: None,
+            });
+            let child = dir.join(&entry.name);
+            // 打不开的子目录沿用流式遍历语义：跳过该目录，继续拉其他内容。
+            let _ = collect_manifest(&child, &path, entries);
+        } else {
+            entries.push(ManifestEntry {
+                path,
+                entry_type: "file",
+                size: Some(entry.size),
+            });
+        }
+    })?;
+    Some(())
+}
+
 #[handler]
 impl ListApi {
     #[allow(clippy::needless_pass_by_ref_mut)]
@@ -282,6 +330,30 @@ impl ListApi {
             entries,
         };
         res.render(Json(response));
+    }
+}
+
+struct ManifestApi {
+    root: PathBuf,
+}
+
+#[handler]
+impl ManifestApi {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+        let path = req.param::<String>("path").unwrap_or_default();
+        let root = self.root.clone();
+        let Ok(manifest) =
+            tokio::task::spawn_blocking(move || manifest_directory(&root, &path)).await
+        else {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        };
+        let Some(entries) = manifest else {
+            res.status_code(StatusCode::NOT_FOUND);
+            return;
+        };
+        res.render(Json(ManifestResponse { entries }));
     }
 }
 
@@ -806,7 +878,12 @@ pub fn list_routes(root: PathBuf, port: u16) -> Router {
         .push(
             Router::with_path("/api/zip/{**path}")
                 .filter(filters::get())
-                .goal(ZipApi::new(root)),
+                .goal(ZipApi::new(root.clone())),
+        )
+        .push(
+            Router::with_path("/api/manifest/{**path}")
+                .filter(filters::get())
+                .goal(ManifestApi { root }),
         )
 }
 

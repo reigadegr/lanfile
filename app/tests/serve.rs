@@ -157,6 +157,34 @@ async fn api_list_returns_404_for_missing_directory() {
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
 
+#[tokio::test]
+async fn api_manifest_returns_flat_tree_metadata() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub").join("empty")).unwrap();
+    std::fs::write(dir.root().join("sub").join("a.txt"), "abc").unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/manifest/sub")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+
+    let body = res.take_string().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let by_path: std::collections::HashMap<&str, &serde_json::Value> = entries
+        .iter()
+        .map(|entry| (entry["path"].as_str().unwrap(), entry))
+        .collect();
+    let file = by_path.get("a.txt").unwrap();
+    assert_eq!(file["type"], "file");
+    assert_eq!(file["size"], 3);
+    let dir = by_path.get("empty").unwrap();
+    assert_eq!(dir["type"], "dir");
+    assert!(dir["size"].is_null());
+}
+
 // ---- /files 与 /pull：这两条端点由 app 的 hyper 快路径在 salvo 路由之前直接服务 ----
 // 以下测试都起真正的 `serve`（快路径），用裸 TCP 打过去，测的就是生产里真正跑的那条路，
 // 不再经 salvo 路由登记 /files、/pull（生产里 salvo 那边永远收不到这两条）。
@@ -914,6 +942,40 @@ async fn get_flat_does_not_nest() {
         std::fs::read(dst.root().join("deeper").join("c.bin")).unwrap(),
         vec![1_u8, 2, 3, 4, 5]
     );
+
+    server.abort();
+}
+
+/// 清单直链的 `--flat` 语义与逐个拉取一致：不套远端目录名这一层。
+#[tokio::test]
+async fn get_manifest_direct_link_flat_does_not_nest() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub").join("a.txt"), "abc").unwrap();
+    std::fs::write(dir.root().join("sub").join("b.bin"), [1, 2, 3]).unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        format!("http://{addr}/#sub"),
+        dst.root().to_string_lossy().into(),
+        "--flat".into(),
+    ])
+    .await
+    .unwrap();
+
+    assert!(!dst.root().join("sub").exists());
+    assert_eq!(std::fs::read(dst.root().join("a.txt")).unwrap(), b"abc");
+    assert_eq!(std::fs::read(dst.root().join("b.bin")).unwrap(), [1, 2, 3]);
 
     server.abort();
 }

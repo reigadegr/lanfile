@@ -51,6 +51,26 @@ struct ListResponse {
     entries: Vec<RemoteEntry>,
 }
 
+/// `/api/manifest` 返回的一条扁平条目，`path` 相对指定的远端目录。
+#[derive(Deserialize)]
+pub struct ManifestEntry {
+    pub path: String,
+    #[serde(rename = "type")]
+    kind: String,
+    pub size: Option<u64>,
+}
+
+impl ManifestEntry {
+    pub fn is_dir(&self) -> bool {
+        self.kind == "dir"
+    }
+}
+
+#[derive(Deserialize)]
+struct ManifestResponse {
+    entries: Vec<ManifestEntry>,
+}
+
 /// 取一层目录的条目：`GET /api/list[/<remote>]`。正文按 `Content-Length` 增量读满，连接干净
 /// 归还池子复用；读不满即截断，连接丢弃。
 pub async fn list_entries(
@@ -83,6 +103,37 @@ pub async fn list_entries(
     }
     pool.release(limited.into_inner());
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
+}
+
+/// 一次性取整棵远端目录的元数据清单。
+pub async fn fetch_manifest(
+    pool: &Pool,
+    host: &str,
+    remote: &str,
+) -> Result<Vec<ManifestEntry>, Error> {
+    let path = if remote.is_empty() {
+        "/api/manifest".to_string()
+    } else {
+        format!("/api/manifest/{}", encode_path(remote))
+    };
+    let (reader, declared) = http_get(pool, host, &path).await?;
+    let len = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
+    let mut limited = reader.take(len);
+    let mut body = Vec::new();
+    tokio::time::timeout(READ_TIMEOUT, limited.read_to_end(&mut body))
+        .await
+        .map_err(|_| Error::Timeout {
+            phase: "读取目录清单",
+        })??;
+    if body.len() as u64 != len {
+        return Err(Error::Truncated {
+            remote: remote.to_string(),
+            want: len,
+            got: body.len() as u64,
+        });
+    }
+    pool.release(limited.into_inner());
+    Ok(serde_json::from_slice::<ManifestResponse>(&body)?.entries)
 }
 
 /// 一次抓取里正文走的搬运方式。

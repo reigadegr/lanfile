@@ -32,7 +32,7 @@ pub enum Kind {
     Dir,
     /// `/files/`、`/pull/` 直链：直接当文件。
     File,
-    /// `/stream/<sub>` 或 `/#<sub>`：一次请求把整棵树流下来（sendfile + splice）。
+    /// `/stream/<sub>` 或 `/#<sub>`：清单并发；旧服务端回退单连接流式。
     Stream,
 }
 
@@ -130,7 +130,7 @@ fn parse_source(url: &str) -> Result<Source, Error> {
 
 /// 认直链，给出 URL 里已经指明的那条远端路径：
 /// - `/files/<sub>`、`/pull/<sub>` 当文件，`/api/zip/<sub>`、`/api/list/<sub>` 当目录；
-/// - `/api/stream/<sub>` 与 `/#<sub>` 走流式（一次请求拉整棵树）；
+/// - `/api/stream/<sub>` 与 `/#<sub>` 走清单并发（旧服务端回退流式）；
 /// - 其余非空路径本身就是远端，kind 待探测——`http://h/.pi` 等价于 `lanfile get http://h .pi`；
 /// - 只有空路径（`http://h`、`http://h/`）返回 `None`，remote 留给位置参数。
 fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
