@@ -38,7 +38,6 @@ const STREAM_READ_BUF: usize = 64 * 1024;
 #[derive(Default)]
 pub struct StreamStats {
     pub files: u64,
-    pub dirs: u64,
     pub bytes: u64,
     pub spliced: u64,
     pub copied: u64,
@@ -48,7 +47,6 @@ pub struct StreamStats {
 impl StreamStats {
     pub const fn merge(&mut self, other: &Self) {
         self.files += other.files;
-        self.dirs += other.dirs;
         self.bytes += other.bytes;
         self.spliced += other.spliced;
         self.copied += other.copied;
