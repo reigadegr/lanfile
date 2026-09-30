@@ -178,8 +178,15 @@ fn stream_file_content(
 
     // 剩下的正文不在缓冲区里，直接从 socket 搬。
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Moved::Done(_) = transfer(socket, file, remaining)? {
-        return Ok(());
+    if let Moved::Done(copied) = transfer(socket, file, remaining)? {
+        if copied == remaining {
+            return Ok(());
+        }
+        return Err(Error::Truncated {
+            remote: format!("{remote}/{rel}"),
+            want: size,
+            got: size - remaining + copied,
+        });
     }
 
     // 非 Linux/Android，或目标文件系统不支持 splice_write：用户态读写兜底
@@ -318,4 +325,44 @@ fn parse_status(line: &str) -> Option<u16> {
         .position(u8::is_ascii_whitespace)
         .unwrap_or(token.len());
     std::str::from_utf8(&token[..end]).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn stream_file_content_rejects_partial_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+
+        let payload = b"abc";
+        peer.write_all(payload).unwrap();
+        drop(peer);
+
+        let root =
+            std::env::temp_dir().join(format!("lanfile-stream-truncated-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("partial");
+        let file = File::create(&file_path).unwrap();
+        let mut reader = BufferedSocket::new(&stream);
+
+        let error =
+            stream_file_content(&stream, &file, 4, "remote", "partial", &mut reader).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Truncated {
+                want: 4,
+                got: 3,
+                ..
+            }
+        ));
+
+        drop(file);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
