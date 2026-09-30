@@ -576,10 +576,12 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     });
 
     // 收尾：把缓冲区里最后那点没写出去的头/内容刷出去
-    if error.is_none() && !head_buf.is_empty()
-        && let Err(e) = socket.write_all(&head_buf) {
-            error = Some(e);
-        }
+    if error.is_none()
+        && !head_buf.is_empty()
+        && let Err(e) = socket.write_all(&head_buf)
+    {
+        error = Some(e);
+    }
 
     match error {
         Some(e) => Err(e),
