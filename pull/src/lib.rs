@@ -401,7 +401,11 @@ async fn prepare_manifest(
             tokio::fs::create_dir_all(local.join(&entry.path)).await?;
             stats.dirs += 1;
         } else if let Some(size) = entry.size {
-            files.insert(entry.path.clone(), size);
+            if skip_existing(&local.join(&entry.path), Some(size)).await {
+                stats.skipped += 1;
+            } else {
+                files.insert(entry.path.clone(), size);
+            }
         } else {
             return Err(Error::Malformed("清单文件缺少大小"));
         }
@@ -419,21 +423,11 @@ async fn pull_stream_shards(
     let shards = build_shard_tasks(&mut files);
 
     let mut tasks = Vec::with_capacity(STREAM_SHARDS as usize);
-    for (shard, expected) in shards.into_iter().enumerate() {
+    for expected in shards {
         let host = host.to_string();
         let remote = remote.to_string();
         let local = local.to_path_buf();
-        tasks.push(async move {
-            fetch_stream_shard(
-                &host,
-                &remote,
-                &local,
-                shard as u32,
-                STREAM_SHARDS,
-                expected,
-            )
-            .await
-        });
+        tasks.push(async move { fetch_stream_shard(&host, &remote, &local, expected).await });
     }
     let results = futures_util::future::try_join_all(tasks).await?;
     let mut stats = crate::streaming::StreamStats::default();

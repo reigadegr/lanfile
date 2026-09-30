@@ -19,7 +19,7 @@
 use std::{
     borrow::Cow,
     future::Future,
-    io::{self, Read as _, Write as _},
+    io::{self, Read as _},
     net::TcpStream as StdTcpStream,
     path::{Path, PathBuf},
     pin::Pin,
@@ -253,29 +253,17 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     } else {
         "/stream/"
     };
-    let Some(encoded_target) = path.strip_prefix(prefix).and_then(|target| {
-        target
-            .split_once('?')
-            .map_or(Some(target), |(target, _)| Some(target))
-    }) else {
+    let Some(encoded_target) = path.strip_prefix(prefix) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "路径不是 stream 端点",
         ));
     };
-    let query = path.split_once('?').map_or("", |(_, query)| query);
 
     let decoded = decode_url_path(encoded_target);
     if is_batch {
-        if let Ok((shard, shards)) = parse_shard_query(query) {
-            let body = read_request_body(&mut stream, &head)?;
-            lanfile_list::serve_stream_batch(&mut stream, root, &decoded, shard, shards, &body)
-        } else {
-            stream.write_all(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )?;
-            Ok(())
-        }
+        let body = read_request_body(&mut stream, &head)?;
+        lanfile_list::serve_stream_batch(&mut stream, root, &decoded, &body)
     } else {
         lanfile_list::serve_stream(&mut stream, root, &decoded)
     }
@@ -309,40 +297,6 @@ fn read_request_body(stream: &mut StdTcpStream, head: &[u8]) -> io::Result<Vec<u
     let mut body = vec![0_u8; length];
     stream.read_exact(&mut body)?;
     Ok(body)
-}
-
-fn parse_shard_query(query: &str) -> io::Result<(u32, u32)> {
-    let mut shard = None;
-    let mut shards = None;
-    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "分片参数格式错误",
-            ));
-        };
-        let parsed = value
-            .parse::<u32>()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "分片参数不是整数"))?;
-        match key {
-            "shard" if shard.is_none() => shard = Some(parsed),
-            "shards" if shards.is_none() => shards = Some(parsed),
-            "shard" | "shards" => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "分片参数重复"));
-            }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "未知分片参数")),
-        }
-    }
-    let (Some(shard), Some(shards)) = (shard, shards) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "缺少分片参数"));
-    };
-    if !(1..=8).contains(&shards) || shard >= shards {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "分片参数超出范围",
-        ));
-    }
-    Ok((shard, shards))
 }
 
 /// 跑 accept 循环，把每条连接交给 [`FastService`]。
@@ -440,7 +394,7 @@ mod tests {
 
     use std::borrow::Cow;
 
-    use super::{Prefix, parse_shard_query, route_path, sub_path};
+    use super::{Prefix, route_path, sub_path};
 
     /// 快路径只认这两条前缀：`/pull` 必须由它自己服务，落到 salvo 就丢了零拷贝与不缓存的收益
     #[test]
@@ -459,15 +413,6 @@ mod tests {
         assert!(route_path("/stream/foo").is_none()); // stream 走 peek 分流，不进 hyper
         assert!(route_path("/static/x.css").is_none());
         assert!(route_path("/").is_none());
-    }
-
-    #[test]
-    fn parse_shard_query_accepts_ranges_and_rejects_bad_values() {
-        assert_eq!(parse_shard_query("shard=0&shards=1").unwrap(), (0, 1));
-        assert_eq!(parse_shard_query("shard=3&shards=4").unwrap(), (3, 4));
-        assert!(parse_shard_query("shard=4&shards=4").is_err());
-        assert!(parse_shard_query("shard=0&shards=9").is_err());
-        assert!(parse_shard_query("shard=0").is_err());
     }
 
     /// 这些取值是拿旧二进制实测出来的：每个用例的注释是它当时的响应。

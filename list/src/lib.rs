@@ -576,16 +576,14 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     serve_stream_inner(socket, root, sub, true, None)
 }
 
-/// 服务 `/stream-batch/<sub>?shard=&shards=`：按请求体中的 manifest 索引发文件。
+/// 服务 `/stream-batch/<sub>`：按请求体中的 manifest 索引发文件。
 ///
 /// 目录由客户端根据 manifest 创建，这里不发送目录记录。请求体每条记录为
-/// `路径 NUL + 8 字节小端 size`，服务端不再为 shard 重复遍历目录树。
+/// `路径 NUL`，服务端不再为每个分片重复遍历目录树。
 pub fn serve_stream_batch(
     socket: &mut TcpStream,
     root: &Path,
     sub: &str,
-    _shard: u32,
-    _shards: u32,
     body: &[u8],
 ) -> std::io::Result<()> {
     match parse_stream_batch_body(body) {
@@ -596,7 +594,7 @@ pub fn serve_stream_batch(
     }
 }
 
-fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<(String, u64)>> {
+fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
     let invalid =
         |message: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
     if body.is_empty() {
@@ -621,31 +619,17 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<(String, u64)>> {
         {
             return Err(invalid("stream-batch 路径非法"));
         }
-        let size_start = path_end + 1;
-        let Some(size_end) = size_start.checked_add(8) else {
-            return Err(invalid("stream-batch 缺少文件大小"));
-        };
-        if size_end > body.len() {
-            return Err(invalid("stream-batch 缺少文件大小"));
-        }
-        let mut size_bytes = [0_u8; 8];
-        size_bytes.copy_from_slice(&body[size_start..size_end]);
-        let size = u64::from_le_bytes(size_bytes);
         if !seen.insert(path.to_owned()) {
             return Err(invalid("stream-batch 路径重复"));
         }
-        entries.push((path.to_owned(), size));
-        offset = size_end;
+        entries.push(path.to_owned());
+        offset = path_end + 1;
     }
     Ok(entries)
 }
 
-fn send_batch_entries(
-    target: &Path,
-    entries: &[(String, u64)],
-    entry_tx: &mpsc::SyncSender<zip::Entry>,
-) {
-    for (rel, _) in entries {
+fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<zip::Entry>) {
+    for rel in entries {
         let Some((file, size)) = zip::open_file_under(target, rel) else {
             continue;
         };
@@ -665,7 +649,7 @@ fn serve_stream_inner(
     root: &Path,
     sub: &str,
     send_dirs: bool,
-    batch: Option<Vec<(String, u64)>>,
+    batch: Option<Vec<String>>,
 ) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
@@ -1003,15 +987,14 @@ mod tests {
     #[test]
     fn parse_stream_batch_body_accepts_compact_entries() {
         let mut body = Vec::new();
-        for (path, size) in [("a.txt", 3_u64), ("dir/b.bin", 9)] {
+        for path in ["a.txt", "dir/b.bin"] {
             body.extend_from_slice(path.as_bytes());
             body.push(0);
-            body.extend_from_slice(&size.to_le_bytes());
         }
 
         assert_eq!(
             parse_stream_batch_body(&body).unwrap(),
-            [("a.txt".to_owned(), 3), ("dir/b.bin".to_owned(), 9)]
+            ["a.txt".to_owned(), "dir/b.bin".to_owned()]
         );
     }
 
@@ -1019,9 +1002,9 @@ mod tests {
     fn parse_stream_batch_body_rejects_bad_entries() {
         for body in [
             &b"a.txt"[..],
-            &b"/a.txt\0\0\0\0\0\0\0\0"[..],
-            &b"../a.txt\0\0\0\0\0\0\0\0"[..],
-            &b"a.txt\0\0\0\0\0\0\0\0a.txt\0\0\0\0\0\0\0\0"[..],
+            &b"/a.txt\0"[..],
+            &b"../a.txt\0"[..],
+            &b"a.txt\0a.txt\0"[..],
         ] {
             assert!(parse_stream_batch_body(body).is_err());
         }

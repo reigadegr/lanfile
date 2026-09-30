@@ -1017,27 +1017,33 @@ async fn get_stream_shards_preserve_manifest_structure() {
     );
     assert_eq!(std::fs::read(mirror.join("b.txt")).unwrap(), b"abc");
 
+    std::fs::write(mirror.join("deep").join("a.bin"), [9, 9, 9]).unwrap();
+    std::fs::write(mirror.join("b.txt"), "too-long").unwrap();
+    lanfile_pull::run(&[
+        format!("http://{addr}/#sub"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(mirror.join("deep").join("a.bin")).unwrap(),
+        [9, 9, 9]
+    );
+    assert_eq!(std::fs::read(mirror.join("b.txt")).unwrap(), b"abc");
+
     server.abort();
 }
 
 #[tokio::test]
-async fn stream_batch_rejects_invalid_shard_parameters() {
+async fn stream_batch_accepts_empty_index_request() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    for path in [
-        "/stream-batch/?shard=4&shards=4",
-        "/stream-batch/?shard=0&shards=9",
-        "/stream-batch/?shard=0",
-    ] {
-        let (head, body) = http_request(addr, "GET", path, "").await;
-        assert!(
-            status_line(&head).contains("400"),
-            "expected 400 for {path}"
-        );
-        assert!(body.is_empty(), "400 response should have no body: {path}");
-    }
+    let (head, body) = http_request(addr, "GET", "/stream-batch/", "").await;
+    assert!(status_line(&head).contains("200"));
+    assert!(body.is_empty());
 
     server.abort();
 }

@@ -101,8 +101,6 @@ pub async fn fetch_stream_shard(
     host: &str,
     remote: &str,
     target: &Path,
-    shard: u32,
-    shards: u32,
     entries: Vec<(String, u64)>,
 ) -> Result<StreamStats, Error> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(host))
@@ -118,16 +116,12 @@ pub async fn fetch_stream_shard(
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
     let mut request_body = Vec::new();
-    for (path, size) in &entries {
+    for (path, _) in &entries {
         request_body.extend_from_slice(path.as_bytes());
         request_body.push(0);
-        request_body.extend_from_slice(&size.to_le_bytes());
     }
     let expected = entries.into_iter().collect::<HashMap<_, _>>();
-    let request_path = format!(
-        "/stream-batch/{}?shard={shard}&shards={shards}",
-        encode_path(remote)
-    );
+    let request_path = format!("/stream-batch/{}", encode_path(remote));
     let request = StreamRequest {
         path: request_path,
         body: Some(request_body),
