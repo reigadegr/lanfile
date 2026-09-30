@@ -980,6 +980,68 @@ async fn get_manifest_direct_link_flat_does_not_nest() {
     server.abort();
 }
 
+/// 分片流由 manifest 建目录，正文流只发文件；空目录和点文件不能在这一步丢掉。
+#[tokio::test]
+async fn get_stream_shards_preserve_manifest_structure() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub").join("empty")).unwrap();
+    std::fs::create_dir_all(dir.root().join("sub").join("deep")).unwrap();
+    std::fs::write(dir.root().join("sub").join(".hidden"), "secret").unwrap();
+    std::fs::write(dir.root().join("sub").join("deep").join("a.bin"), [1, 2, 3]).unwrap();
+    std::fs::write(dir.root().join("sub").join("b.txt"), "abc").unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        format!("http://{addr}/#sub"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+
+    let mirror = dst.root().join("sub");
+    assert!(mirror.join("empty").is_dir());
+    assert_eq!(std::fs::read(mirror.join(".hidden")).unwrap(), b"secret");
+    assert_eq!(
+        std::fs::read(mirror.join("deep").join("a.bin")).unwrap(),
+        [1, 2, 3]
+    );
+    assert_eq!(std::fs::read(mirror.join("b.txt")).unwrap(), b"abc");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn stream_batch_rejects_invalid_shard_parameters() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("a.txt"), "abc").unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    for path in [
+        "/stream-batch/?shard=4&shards=4",
+        "/stream-batch/?shard=0&shards=9",
+        "/stream-batch/?shard=0",
+    ] {
+        let (head, body) = http_request(addr, "GET", path, "").await;
+        assert!(
+            status_line(&head).contains("400"),
+            "expected 400 for {path}"
+        );
+        assert!(body.is_empty(), "400 response should have no body: {path}");
+    }
+
+    server.abort();
+}
+
 /// 文件夹直链 `http://h/api/zip/<sub>`、`http://h/#<sub>`：当目录整棵拉，落盘语义与
 /// `lanfile get http://h <sub>` 一致（默认套一层）。
 #[tokio::test]

@@ -47,8 +47,12 @@ use crate::fetch::{
     Fetched, ManifestEntry, RemoteEntry, Via, fetch_file, fetch_manifest, list_entries,
 };
 use crate::http::Pool;
+use crate::streaming::{fetch_stream_shard, shard_of};
 use futures_util::stream::{self, StreamExt};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 /// 同时在飞的文件任务数（逐个/清单模式）。
 ///
@@ -57,6 +61,8 @@ use std::path::{Path, PathBuf};
 /// 一个文件一个连接，pool 的容量由这个数自然定住。
 ///
 const DOWNLOAD_CONCURRENCY: usize = 8;
+/// 分片流固定使用 4 条连接；先验证正确性与默认吞吐，再考虑配置化或自动调参。
+const STREAM_SHARDS: u32 = 4;
 
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
@@ -166,9 +172,23 @@ async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
         Err(Error::Http { status: 404, .. }) => return run_stream(p).await,
         Err(error) => return Err(error.into()),
     };
-    let stats = pull_manifest(pool, &p.host, &p.remote, &target, entries).await?;
+    let (mut stats, files) = prepare_manifest(&target, &entries).await?;
+    let stats = match pull_stream_shards(&p.host, &p.remote, &target, files).await {
+        Ok(stream_stats) => {
+            stats.files = stream_stats.files;
+            stats.bytes = stream_stats.bytes;
+            stats.via.spliced = stream_stats.spliced;
+            stats.via.copied = stream_stats.copied;
+            stats.via.prebuffered = stream_stats.prebuffered;
+            stats
+        }
+        Err(Error::Http { status: 404, .. }) => {
+            pull_manifest(pool, &p.host, &p.remote, &target, entries).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
     eprintln!(
-        "lanfile get: {}/{} -> {}（清单并发：{} 文件，{} 目录，{} 字节，跳过已存在 {} 个）",
+        "lanfile get: {}/{} -> {}（清单分片流：{} 文件，{} 目录，{} 字节，跳过已存在 {} 个）",
         p.base,
         p.remote,
         target.display(),
@@ -424,6 +444,65 @@ async fn pull_manifest(
             }
             FileOutcome::Failed(name, error) => eprintln!("  跳过 {name}：{error}"),
         }
+    }
+    Ok(stats)
+}
+
+/// 先按 manifest 建出全部目录（包括空目录），并收集文件大小供 shard 校验。
+async fn prepare_manifest(
+    local: &Path,
+    entries: &[ManifestEntry],
+) -> Result<(Stats, HashMap<String, u64>), Error> {
+    tokio::fs::create_dir_all(local).await?;
+    let mut stats = Stats::default();
+    let mut files = HashMap::with_capacity(entries.len() / 2);
+    for entry in entries {
+        if entry.is_dir() {
+            tokio::fs::create_dir_all(local.join(&entry.path)).await?;
+            stats.dirs += 1;
+        } else if let Some(size) = entry.size {
+            files.insert(entry.path.clone(), size);
+        } else {
+            return Err(Error::Malformed("清单文件缺少大小"));
+        }
+    }
+    Ok((stats, files))
+}
+
+/// 4 个 shard 并发接收；每个任务持有 manifest 中自己的文件集合并做精确校验。
+async fn pull_stream_shards(
+    host: &str,
+    remote: &str,
+    local: &Path,
+    mut files: HashMap<String, u64>,
+) -> Result<crate::streaming::StreamStats, Error> {
+    let mut shards: Vec<HashMap<String, u64>> = vec![HashMap::new(); STREAM_SHARDS as usize];
+    for (path, size) in files.drain() {
+        let shard = shard_of(&path, STREAM_SHARDS) as usize;
+        shards[shard].insert(path, size);
+    }
+
+    let mut tasks = Vec::with_capacity(STREAM_SHARDS as usize);
+    for (shard, expected) in shards.into_iter().enumerate() {
+        let host = host.to_string();
+        let remote = remote.to_string();
+        let local = local.to_path_buf();
+        tasks.push(async move {
+            fetch_stream_shard(
+                &host,
+                &remote,
+                &local,
+                shard as u32,
+                STREAM_SHARDS,
+                expected,
+            )
+            .await
+        });
+    }
+    let results = futures_util::future::try_join_all(tasks).await?;
+    let mut stats = crate::streaming::StreamStats::default();
+    for result in results {
+        stats.merge(&result);
     }
     Ok(stats)
 }

@@ -520,6 +520,20 @@ impl ZipApi {
 const STREAM_DIR: u8 = 0;
 const STREAM_FILE: u8 = 1;
 
+/// 稳定分片哈希：路径字节的 FNV-1a。
+///
+/// 客户端按 manifest 的同一相对路径计算 shard，不能依赖 Rust 默认 Hasher 的跨版本实现。
+#[must_use]
+pub fn shard_of(path: &str, shards: u32) -> u32 {
+    debug_assert!((1..=8).contains(&shards));
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in path.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash % shards
+}
+
 /// 服务端头部缓冲区的大小，也是「小文件直接塞进缓冲区」的上限。
 ///
 /// 头部分（类型字节 + NUL 结尾路径 + 8 字节长度）每条不到一百字节，逐条 `write_all`
@@ -572,6 +586,29 @@ fn read_file_prefix(file: &File, buf: &mut [u8]) -> std::io::Result<()> {
 /// 大文件先 flush 头部缓冲，正文交给 `sendfile` 直发。这样每棵树的 `write` 系统调用
 /// 数由条目数降到「每 64 KiB 一次」，而大文件的正文仍然完全走内核零拷贝。
 pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::Result<()> {
+    serve_stream_inner(socket, root, sub, true, None)
+}
+
+/// 服务 `/stream-batch/<sub>?shard=&shards=`：只发匹配文件的紧凑流。
+///
+/// 目录由客户端根据 manifest 创建，这里不发送目录记录。参数校验由快路径完成。
+pub fn serve_stream_batch(
+    socket: &mut TcpStream,
+    root: &Path,
+    sub: &str,
+    shard: u32,
+    shards: u32,
+) -> std::io::Result<()> {
+    serve_stream_inner(socket, root, sub, false, Some((shard, shards)))
+}
+
+fn serve_stream_inner(
+    socket: &mut TcpStream,
+    root: &Path,
+    sub: &str,
+    send_dirs: bool,
+    shard: Option<(u32, u32)>,
+) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
         socket.write_all(
@@ -603,7 +640,7 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
             }
 
             match entry {
-                zip::Entry::Dir { name } => {
+                zip::Entry::Dir { name } if send_dirs => {
                     // walk 给的 name 形如 `/sub/`；剥掉首尾斜杠即相对路径，根目录条目为空跳过
                     let rel = name.trim_start_matches('/').trim_end_matches('/');
                     if rel.is_empty() {
@@ -614,6 +651,7 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
                     head_buf.extend_from_slice(rel.as_bytes());
                     head_buf.push(0);
                 }
+                zip::Entry::Dir { .. } => {}
                 zip::Entry::File { file, size, name } => {
                     let rel = name.trim_start_matches('/');
                     // 头部三个 write_all 合并进缓冲区一次写出
@@ -656,8 +694,17 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
 
     let (entry_tx, entry_rx) = mpsc::sync_channel(STREAM_ENTRY_QUEUE);
     let producer_panicked = thread::scope(|scope| {
-        let producer = scope.spawn(move || {
-            zip::walk_stream(&target, "", &mut |entry| entry_tx.send(entry).is_ok());
+        let producer = scope.spawn(move || match shard {
+            Some((shard, shards)) => zip::walk_stream_filtered(
+                &target,
+                "",
+                &|name: &str| {
+                    let rel = name.trim_start_matches('/');
+                    shard_of(rel, shards) == shard
+                },
+                &mut |entry| entry_tx.send(entry).is_ok(),
+            ),
+            None => zip::walk_stream(&target, "", &mut |entry| entry_tx.send(entry).is_ok()),
         });
 
         while let Ok(entry) = entry_rx.recv() {
@@ -895,9 +942,18 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{Item, ZIP_QUEUE, send_file_chunks};
+    use super::{Item, ZIP_QUEUE, send_file_chunks, shard_of};
 
     const FILE_SIZE: usize = 64 * 1024 * 1024;
+
+    #[test]
+    fn shard_of_keeps_paths_stable() {
+        assert_eq!(shard_of("", 1), 0);
+        assert_eq!(shard_of("a.txt", 1), 0);
+        let shard = shard_of("dir/a.txt", 4);
+        assert!(shard < 4);
+        assert_eq!(shard_of("dir/a.txt", 4), shard);
+    }
 
     /// 复刻流水线的读取侧：阻塞线程分块读文件 → 有界 channel → 异步侧消费并归还缓冲。
     /// 生产路径固定用 `ZIP_CHUNK`，这里开放 `chunk_size` 只为观察分块大小对吞吐的影响。

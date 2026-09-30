@@ -38,7 +38,19 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
 
 /// `/stream` 专用遍历：不排序，Linux/Android 直接相对父目录 fd 打开子项。
 pub fn walk_stream(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) {
-    walk_stream_inner(dir, prefix, on_entry);
+    walk_stream_inner(dir, prefix, &|_| true, on_entry);
+}
+
+/// `/stream-batch` 专用遍历：文件在打开 fd 前先问 `should_send`。
+///
+/// 目录仍完整遍历；不匹配的文件直接跳过，避免为每个 shard 白付 `openat+fstat`。
+pub fn walk_stream_filtered(
+    dir: &Path,
+    prefix: &str,
+    should_send: &impl Fn(&str) -> bool,
+    on_entry: &mut impl FnMut(Entry) -> bool,
+) {
+    walk_stream_inner(dir, prefix, should_send, on_entry);
 }
 
 /// 按名称排序目录条目，保证 zip 内顺序确定；两个平台的实现共用。
@@ -47,7 +59,12 @@ fn sort_by_name<T>(entries: &mut [(T, String)]) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn walk_stream_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
+fn walk_stream_inner(
+    dir: &Path,
+    prefix: &str,
+    should_send: &impl Fn(&str) -> bool,
+    on_entry: &mut impl FnMut(Entry) -> bool,
+) -> bool {
     let Ok(dirfd) = rfs::openat(
         rfs::CWD,
         dir,
@@ -61,13 +78,14 @@ fn walk_stream_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) 
     }) {
         return false;
     }
-    walk_stream_fd(&dirfd, prefix, on_entry)
+    walk_stream_fd(&dirfd, prefix, should_send, on_entry)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn walk_stream_fd(
     dirfd: &rustix::fd::OwnedFd,
     prefix: &str,
+    should_send: &impl Fn(&str) -> bool,
     on_entry: &mut impl FnMut(Entry) -> bool,
 ) -> bool {
     let mut buf = [MaybeUninit::<u8>::uninit(); 8192];
@@ -103,11 +121,14 @@ fn walk_stream_fd(
                 name: format!("{zip_name}/"),
             });
             if emitted {
-                walk_stream_fd(&child, &zip_name, on_entry)
+                walk_stream_fd(&child, &zip_name, should_send, on_entry)
             } else {
                 false
             }
         } else if actual_ft.is_file() {
+            if !should_send(&zip_name) {
+                continue;
+            }
             let opened = rfs::openat(
                 dirfd,
                 entry.file_name(),
@@ -270,7 +291,12 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn walk_stream_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
+fn walk_stream_inner(
+    dir: &Path,
+    prefix: &str,
+    should_send: &impl Fn(&str) -> bool,
+    on_entry: &mut impl FnMut(Entry) -> bool,
+) -> bool {
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return true;
     };
@@ -293,8 +319,11 @@ fn walk_stream_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) 
         };
         let ft = metadata.file_type();
         let keep_going = if ft.is_dir() {
-            walk_stream_inner(&path, &zip_name, on_entry)
+            walk_stream_inner(&path, &zip_name, should_send, on_entry)
         } else if ft.is_file() {
+            if !should_send(&zip_name) {
+                continue;
+            }
             match File::open(&path) {
                 Ok(file) => on_entry(Entry::File {
                     file,

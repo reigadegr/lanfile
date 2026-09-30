@@ -1,4 +1,4 @@
-//! `/files`、`/pull`、`/stream` 的 hyper 快路径。
+//! `/files`、`/pull`、`/stream`、`/stream-batch` 的 hyper 快路径。
 //!
 //! salvo 的 `HyperHandler` 每请求要做一整套：按 `Host` 重建 `Uri`、往 `Extensions` 里插
 //! `ConnCtrl`、把路径 `to_owned`、构造 `PathState`、跑一遍路由匹配、重建 handler 链
@@ -19,7 +19,7 @@
 use std::{
     borrow::Cow,
     future::Future,
-    io::{self, Read as _},
+    io::{self, Read as _, Write as _},
     net::TcpStream as StdTcpStream,
     path::{Path, PathBuf},
     pin::Pin,
@@ -180,25 +180,25 @@ const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10)
 ///
 /// 用 `peek` 不消耗 socket 缓冲；是就交给自定义处理，否则原样交回给 hyper。
 /// 带超时，避免客户端连上却不发请求时卡住 accept 循环。
-async fn peek_is_stream(conn: &tokio::net::TcpStream) -> bool {
+async fn peek_stream_prefix(conn: &tokio::net::TcpStream) -> Option<&'static str> {
     let mut buf = [0_u8; 1024];
     let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), conn.peek(&mut buf)).await
     else {
-        return false;
+        return None;
     };
-    let Some(line_end) = buf[..n].windows(2).position(|w| w == b"\r\n") else {
-        return false;
-    };
+    let line_end = buf[..n].windows(2).position(|w| w == b"\r\n")?;
     let line = &buf[..line_end];
     // GET /stream/... HTTP/1.1
-    let Some(space1) = line.iter().position(|&b| b == b' ') else {
-        return false;
-    };
+    let space1 = line.iter().position(|&b| b == b' ')?;
     let rest = &line[space1 + 1..];
-    let Some(space2) = rest.iter().position(|&b| b == b' ') else {
-        return false;
-    };
-    rest[..space2].starts_with(b"/stream/")
+    let space2 = rest.iter().position(|&b| b == b' ')?;
+    if rest[..space2].starts_with(b"/stream-batch/") {
+        Some("/stream-batch/")
+    } else if rest[..space2].starts_with(b"/stream/") {
+        Some("/stream/")
+    } else {
+        None
+    }
 }
 
 /// 处理一条 `/stream/` 连接：读请求头、解析路径、交给阻塞线程跑同步 sendfile 流程。
@@ -246,15 +246,71 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     };
     let path = std::str::from_utf8(&rest[..space2])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "请求路径不是 UTF-8"))?;
-    let Some(encoded_sub) = path.strip_prefix("/stream/") else {
+    let is_batch = path.starts_with("/stream-batch/");
+    let prefix = if is_batch {
+        "/stream-batch/"
+    } else {
+        "/stream/"
+    };
+    let Some(encoded_target) = path.strip_prefix(prefix).and_then(|target| {
+        target
+            .split_once('?')
+            .map_or(Some(target), |(target, _)| Some(target))
+    }) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "路径不以 /stream/ 开头",
+            "路径不是 stream 端点",
         ));
     };
+    let query = path.split_once('?').map_or("", |(_, query)| query);
 
-    let decoded = decode_url_path(encoded_sub);
-    lanfile_list::serve_stream(&mut stream, root, &decoded)
+    let decoded = decode_url_path(encoded_target);
+    if is_batch {
+        if let Ok((shard, shards)) = parse_shard_query(query) {
+            lanfile_list::serve_stream_batch(&mut stream, root, &decoded, shard, shards)
+        } else {
+            stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            Ok(())
+        }
+    } else {
+        lanfile_list::serve_stream(&mut stream, root, &decoded)
+    }
+}
+
+fn parse_shard_query(query: &str) -> io::Result<(u32, u32)> {
+    let mut shard = None;
+    let mut shards = None;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "分片参数格式错误",
+            ));
+        };
+        let parsed = value
+            .parse::<u32>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "分片参数不是整数"))?;
+        match key {
+            "shard" if shard.is_none() => shard = Some(parsed),
+            "shards" if shards.is_none() => shards = Some(parsed),
+            "shard" | "shards" => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "分片参数重复"));
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "未知分片参数")),
+        }
+    }
+    let (Some(shard), Some(shards)) = (shard, shards) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "缺少分片参数"));
+    };
+    if !(1..=8).contains(&shards) || shard >= shards {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "分片参数超出范围",
+        ));
+    }
+    Ok((shard, shards))
 }
 
 /// 跑 accept 循环，把每条连接交给 [`FastService`]。
@@ -301,7 +357,7 @@ pub async fn serve(
         }
 
         // /stream 分流：peek 一眼请求行，命中就完全绕开 hyper
-        if peek_is_stream(&conn).await {
+        if peek_stream_prefix(&conn).await.is_some() {
             let root = Arc::clone(&root);
             tokio::spawn(async move {
                 if let Err(error) = handle_stream_connection(conn, root).await {
@@ -352,7 +408,7 @@ mod tests {
 
     use std::borrow::Cow;
 
-    use super::{Prefix, route_path, sub_path};
+    use super::{Prefix, parse_shard_query, route_path, sub_path};
 
     /// 快路径只认这两条前缀：`/pull` 必须由它自己服务，落到 salvo 就丢了零拷贝与不缓存的收益
     #[test]
@@ -371,6 +427,15 @@ mod tests {
         assert!(route_path("/stream/foo").is_none()); // stream 走 peek 分流，不进 hyper
         assert!(route_path("/static/x.css").is_none());
         assert!(route_path("/").is_none());
+    }
+
+    #[test]
+    fn parse_shard_query_accepts_ranges_and_rejects_bad_values() {
+        assert_eq!(parse_shard_query("shard=0&shards=1").unwrap(), (0, 1));
+        assert_eq!(parse_shard_query("shard=3&shards=4").unwrap(), (3, 4));
+        assert!(parse_shard_query("shard=4&shards=4").is_err());
+        assert!(parse_shard_query("shard=0&shards=9").is_err());
+        assert!(parse_shard_query("shard=0").is_err());
     }
 
     /// 这些取值是拿旧二进制实测出来的：每个用例的注释是它当时的响应。

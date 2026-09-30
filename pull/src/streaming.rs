@@ -15,7 +15,7 @@
 //! 从缓冲里搬——缓冲区里已有的那点正文先落盘，剩余的直接 `splice` 进文件。
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read as _, Write as _},
     net::TcpStream,
@@ -23,7 +23,7 @@ use std::{
 };
 
 use crate::error::Error;
-use crate::fetch::encode_path;
+use crate::fetch::{Via, encode_path};
 use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::splice::{Moved, transfer};
@@ -40,6 +40,32 @@ pub struct StreamStats {
     pub files: u64,
     pub dirs: u64,
     pub bytes: u64,
+    pub spliced: u64,
+    pub copied: u64,
+    pub prebuffered: u64,
+}
+
+impl StreamStats {
+    pub const fn merge(&mut self, other: &Self) {
+        self.files += other.files;
+        self.dirs += other.dirs;
+        self.bytes += other.bytes;
+        self.spliced += other.spliced;
+        self.copied += other.copied;
+        self.prebuffered += other.prebuffered;
+    }
+}
+
+/// 按 manifest 相对路径计算稳定 shard；必须与服务端保持同一 FNV-1a 规则。
+#[must_use]
+pub fn shard_of(path: &str, shards: u32) -> u32 {
+    debug_assert!((1..=8).contains(&shards));
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in path.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash % shards
 }
 
 /// 从 `host` 拉 `remote` 子树到本地 `target`（`target` 已经是落盘根目录，不含 basename 层）。
@@ -60,7 +86,55 @@ pub async fn fetch_stream(host: &str, remote: &str, target: &Path) -> Result<Str
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        fetch_stream_blocking(stream, &host_owned, &remote_owned, &target_owned)
+        let request_path = format!("/stream/{}", encode_path(&remote_owned));
+        fetch_stream_blocking(
+            stream,
+            &host_owned,
+            &request_path,
+            &remote_owned,
+            &target_owned,
+            true,
+            None,
+        )
+    })
+    .await
+    .map_err(|join| Error::Io(io::Error::other(join)))?
+}
+
+pub async fn fetch_stream_shard(
+    host: &str,
+    remote: &str,
+    target: &Path,
+    shard: u32,
+    shards: u32,
+    expected: HashMap<String, u64>,
+) -> Result<StreamStats, Error> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(host))
+        .await
+        .map_err(|_| Error::Timeout { phase: "连接" })?
+        .map_err(|source| Error::Connect {
+            host: host.to_string(),
+            source,
+        })?;
+    let _ = stream.set_nodelay(true);
+    let stream = stream.into_std()?;
+    let host_owned = host.to_string();
+    let remote_owned = remote.to_string();
+    let target_owned = target.to_path_buf();
+    let request_path = format!(
+        "/stream-batch/{}?shard={shard}&shards={shards}",
+        encode_path(remote)
+    );
+    tokio::task::spawn_blocking(move || {
+        fetch_stream_blocking(
+            stream,
+            &host_owned,
+            &request_path,
+            &remote_owned,
+            &target_owned,
+            false,
+            Some(expected),
+        )
     })
     .await
     .map_err(|join| Error::Io(io::Error::other(join)))?
@@ -70,22 +144,28 @@ pub async fn fetch_stream(host: &str, remote: &str, target: &Path) -> Result<Str
 fn fetch_stream_blocking(
     mut stream: TcpStream,
     host: &str,
+    request_path: &str,
     remote: &str,
     target: &Path,
+    accept_dirs: bool,
+    mut expected: Option<HashMap<String, u64>>,
 ) -> Result<StreamStats, Error> {
     // tokio 的 socket 是非阻塞的，切回阻塞模式才能用同步 IO
     stream.set_nonblocking(false)?;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
-    let path = format!("/stream/{}", encode_path(remote));
+    let path = request_path;
     stream.write_all(
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
     )?;
 
     let status = read_response_head(&mut stream)?;
     if status != 200 {
-        return Err(Error::Http { status, path });
+        return Err(Error::Http {
+            status,
+            path: path.to_string(),
+        });
     }
 
     std::fs::create_dir_all(target)?;
@@ -119,6 +199,7 @@ fn fetch_stream_blocking(
 
         match kind[0] {
             0 => {
+                check_dir_record(accept_dirs)?;
                 ensure_dir(&target.join(&rel), &mut made_dirs)?;
                 stats.dirs += 1;
             }
@@ -126,19 +207,81 @@ fn fetch_stream_blocking(
                 let mut size_buf = [0_u8; 8];
                 reader.read_exact(&mut size_buf)?;
                 let size = u64::from_le_bytes(size_buf);
+                check_expected(&mut expected, &rel, size)?;
                 let file_path = target.join(&rel);
                 if let Some(parent) = file_path.parent() {
                     ensure_dir(parent, &mut made_dirs)?;
                 }
                 let file = File::create(&file_path)?;
-                stream_file_content(&stream, &file, size, remote, &rel, &mut reader)?;
-                stats.files += 1;
-                stats.bytes += size;
+                match stream_file_content(&stream, &file, size, remote, &rel, &mut reader) {
+                    Ok(via) => {
+                        match via {
+                            Via::Splice => stats.spliced += 1,
+                            Via::Copy => stats.copied += 1,
+                            Via::Prebuffered => stats.prebuffered += 1,
+                        }
+                        stats.files += 1;
+                        stats.bytes += size;
+                    }
+                    Err(error) => {
+                        drop(file);
+                        let _ = std::fs::remove_file(&file_path);
+                        return Err(error);
+                    }
+                }
             }
             _ => return Err(Error::Malformed("远端返回了未知的条目类型")),
         }
     }
+    check_missing(expected.as_ref())?;
     Ok(stats)
+}
+
+fn check_dir_record(accept_dirs: bool) -> Result<(), Error> {
+    if accept_dirs {
+        return Ok(());
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "分片流不应包含目录记录",
+    )))
+}
+
+fn check_expected(
+    expected: &mut Option<HashMap<String, u64>>,
+    rel: &str,
+    size: u64,
+) -> Result<(), Error> {
+    let Some(expected) = expected.as_mut() else {
+        return Ok(());
+    };
+    let want = expected.remove(rel).ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("分片流包含清单外的路径：{rel}"),
+        ))
+    })?;
+    if size != want {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("分片流文件大小与清单不一致：{rel} 应得 {want} 字节，收到 {size} 字节"),
+        )));
+    }
+    Ok(())
+}
+
+fn check_missing(expected: Option<&HashMap<String, u64>>) -> Result<(), Error> {
+    let Some(expected) = expected.filter(|expected| !expected.is_empty()) else {
+        return Ok(());
+    };
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "分片流缺少清单中的 {} 个文件，首个为 {}",
+            expected.len(),
+            expected.keys().next().map_or("", String::as_str)
+        ),
+    )))
 }
 
 /// 创建目录并记录结果；同一传输内重复父目录只落一次系统调用。
@@ -160,9 +303,9 @@ fn stream_file_content(
     remote: &str,
     rel: &str,
     reader: &mut BufferedSocket<'_>,
-) -> Result<(), Error> {
+) -> Result<Via, Error> {
     if size == 0 {
-        return Ok(());
+        return Ok(Via::Prebuffered);
     }
 
     // 先把缓冲区里已有的那截正文落盘。缓冲区里可能只装了正文的一部分（大文件），
@@ -173,14 +316,14 @@ fn stream_file_content(
     }
     let remaining = size - from_buf as u64;
     if remaining == 0 {
-        return Ok(());
+        return Ok(Via::Prebuffered);
     }
 
     // 剩下的正文不在缓冲区里，直接从 socket 搬。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Moved::Done(copied) = transfer(socket, file, remaining)? {
         if copied == remaining {
-            return Ok(());
+            return Ok(Via::Splice);
         }
         return Err(Error::Truncated {
             remote: format!("{remote}/{rel}"),
@@ -207,7 +350,7 @@ fn stream_file_content(
         file_ref.write_all(&buf[..n])?;
         remaining -= n as u64;
     }
-    Ok(())
+    Ok(Via::Copy)
 }
 
 /// 带用户态缓冲的 socket 读取器。
@@ -332,6 +475,13 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn shard_of_is_stable_for_one_shard() {
+        assert_eq!(shard_of("", 1), 0);
+        assert_eq!(shard_of("a.txt", 1), 0);
+        assert_eq!(shard_of("dir/a.txt", 1), 0);
+    }
 
     #[test]
     fn stream_file_content_rejects_partial_body() {
