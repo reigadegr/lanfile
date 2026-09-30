@@ -4,6 +4,8 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     sync::Arc,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -460,6 +462,12 @@ const STREAM_BUF: usize = 64 * 1024;
 /// 「读进用户态缓冲 + 与头部一起 write」，一次 `write` 能覆盖几十条记录。
 const SENDFILE_THRESHOLD: u64 = 64 * 1024;
 
+/// 遍历线程交给发送线程的最多条目数。
+///
+/// 队列有界，既限制同时打开的文件 fd，也让发送慢时反过来压住目录遍历。64 个条目足以
+/// 覆盖网络侧正在写的一批记录，同时不会在深树上占住过多 fd。
+const STREAM_ENTRY_QUEUE: usize = 64;
+
 /// 从文件开头读满 `buf`，不改动文件偏移量（Unix 用 `pread`，非 Unix 复制 fd 后用 `seek`）。
 ///
 /// `/stream` 的小文件走这里：`openat(dirfd, ...)` 拿到的 fd 是共享给 `sendfile` 的，
@@ -485,8 +493,8 @@ fn read_file_prefix(file: &File, buf: &mut [u8]) -> std::io::Result<()> {
 /// 负责写响应头、遍历、逐条发送。响应不带 `Content-Length`，靠 `Connection: close`
 /// 后的 EOF 结束。
 ///
-/// 回调只返回 `bool`（是否继续遍历），因此把会返回 `Err` 的部分收进一个内部闭包，
-/// 由外层把 `Err` 记进 `error` 并停表。
+/// 遍历/打开文件放在一条生产线程上，当前线程只负责组头与写出；两边用有界队列相接，
+/// 元数据遍历可以和网络发送重叠，队列满时生产自然停下来。
 ///
 /// 小文件（< [`SENDFILE_THRESHOLD`]）的内容读进 [`STREAM_BUF`]，与头部一起一次写出；
 /// 大文件先 flush 头部缓冲，正文交给 `sendfile` 直发。这样每棵树的 `write` 系统调用
@@ -504,14 +512,13 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
         b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
     )?;
 
-    // 遍历时只有 `bool` 可用，把 IO 结果收在 `error` 上；回调每次开头检查它，
-    // 一旦出错就立刻返回 `false` 停下遍历。
+    // 遍历线程把已打开的条目交过来；发送回调出错时返回 `false` 并退出接收循环。
     let mut error: Option<std::io::Error> = None;
     // 头 + 小文件内容的攒批缓冲。它同时服务两类条目：目录头只有几十字节，
     // 攒下来减少系统调用；小于阈值的小文件内容也读进来，跟头一起写出。
     let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
 
-    zip::walk_stream(&target, "", &mut |entry| {
+    let mut send_entry = |entry| {
         if error.is_some() {
             return false;
         }
@@ -573,7 +580,26 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
                 false
             }
         }
+    };
+
+    let (entry_tx, entry_rx) = mpsc::sync_channel(STREAM_ENTRY_QUEUE);
+    let producer_panicked = thread::scope(|scope| {
+        let producer = scope.spawn(move || {
+            zip::walk_stream(&target, "", &mut |entry| entry_tx.send(entry).is_ok());
+        });
+
+        while let Ok(entry) = entry_rx.recv() {
+            if !send_entry(entry) {
+                break;
+            }
+        }
+        // 先丢掉接收端，阻塞在 send 上的遍历线程才能拿到错误并停止。
+        drop(entry_rx);
+        producer.join().is_err()
     });
+    if producer_panicked && error.is_none() {
+        error = Some(std::io::Error::other("stream traversal thread panicked"));
+    }
 
     // 收尾：把缓冲区里最后那点没写出去的头/内容刷出去
     if error.is_none()
