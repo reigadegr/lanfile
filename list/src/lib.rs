@@ -511,7 +511,7 @@ pub fn serve_stream(socket: &mut TcpStream, root: &Path, sub: &str) -> std::io::
     // 攒下来减少系统调用；小于阈值的小文件内容也读进来，跟头一起写出。
     let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
 
-    zip::walk(&target, "", &mut |entry| {
+    zip::walk_stream(&target, "", &mut |entry| {
         if error.is_some() {
             return false;
         }

@@ -15,10 +15,11 @@
 //! 从缓冲里搬——缓冲区里已有的那点正文先落盘，剩余的直接 `splice` 进文件。
 
 use std::{
+    collections::HashSet,
     fs::File,
     io::{self, Read as _, Write as _},
     net::TcpStream,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::error::Error;
@@ -91,6 +92,7 @@ fn fetch_stream_blocking(
     let mut stats = StreamStats::default();
     let mut path_buf = Vec::with_capacity(256);
     let mut reader = BufferedSocket::new(&stream);
+    let mut made_dirs = HashSet::<PathBuf>::from([target.to_path_buf()]);
 
     loop {
         // 1 字节类型；干净 EOF 视作收尾
@@ -117,7 +119,7 @@ fn fetch_stream_blocking(
 
         match kind[0] {
             0 => {
-                std::fs::create_dir_all(target.join(&rel))?;
+                ensure_dir(&target.join(&rel), &mut made_dirs)?;
                 stats.dirs += 1;
             }
             1 => {
@@ -126,7 +128,7 @@ fn fetch_stream_blocking(
                 let size = u64::from_le_bytes(size_buf);
                 let file_path = target.join(&rel);
                 if let Some(parent) = file_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    ensure_dir(parent, &mut made_dirs)?;
                 }
                 let file = File::create(&file_path)?;
                 stream_file_content(&stream, &file, size, remote, &rel, &mut reader)?;
@@ -137,6 +139,14 @@ fn fetch_stream_blocking(
         }
     }
     Ok(stats)
+}
+
+/// 创建目录并记录结果；同一传输内重复父目录只落一次系统调用。
+fn ensure_dir(path: &Path, made_dirs: &mut HashSet<PathBuf>) -> io::Result<()> {
+    if made_dirs.insert(path.to_path_buf()) {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
 }
 
 /// 把下一段 `size` 字节从 socket 搬进文件。
