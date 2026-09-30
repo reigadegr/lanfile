@@ -2,7 +2,7 @@
 //! 不打压缩包、不占服务端额外空间。
 //!
 //! 来源两种：
-//! - 裸 host：`http://h [remote] [local]`——`remote` 缺省拉根；给了名字先试目录，
+//! - 裸 host：`http://h [remote] [local]`——`remote` 必须给出；给了名字先试目录，
 //!   `/api/list` 返回 200 当目录拉，404 当单个文件拉；
 //! - 直链：URL 的路径或 fragment 直接指明远端——`http://h/files/<sub>`、`http://h/pull/<sub>`
 //!   当文件，`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录，

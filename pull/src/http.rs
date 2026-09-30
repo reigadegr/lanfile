@@ -2,7 +2,7 @@
 //! 正文由调用方按 `Content-Length` 读完。连接池 [`Pool`] 收口借/还，
 //! [`http_get`] 收口"复用的连接被对端悄悄关掉时换新重试一次"。
 //!
-//! `/stream` 不走这里：它没有 `Content-Length`、连接不复用，整条流程由 `crate::streaming`
+//! `/stream-batch` 不走这里：它没有 `Content-Length`、连接不复用，整条流程由 `crate::streaming`
 //! 用同步 IO 在一个阻塞线程里跑完。
 
 use crate::error::Error;

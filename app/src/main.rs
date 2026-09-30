@@ -193,8 +193,8 @@ impl LogSink {
 
     /// 往本线程的分片里追加一段日志，返回是否已经攒够一批（`true` 时调用方该叫醒写线程）。
     ///
-    /// 分片已经到 [`LOG_PENDING_MAX_PER_SHARD`] 时这一行直接丢掉；丢弃不构成"攒够一批"，
-    /// 因此同样返回 `false`——调用方据此不会为一个已经满的缓冲去叫醒写线程。
+    /// 分片已经到 [`LOG_PENDING_MAX_PER_SHARD`] 时这一行直接丢掉，返回 `false`。
+    /// 未满时分片只要达到 [`LOG_BATCH`] 就返回 `true`，由调用方唤醒写线程。
     fn append(&self, shard: usize, buf: &[u8]) -> bool {
         let mut pending = lock(&self.pending[shard]);
         if pending.len() >= LOG_PENDING_MAX_PER_SHARD {
