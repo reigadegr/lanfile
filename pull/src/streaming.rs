@@ -54,11 +54,6 @@ impl StreamStats {
     }
 }
 
-struct StreamRequest {
-    path: String,
-    body: Vec<u8>,
-}
-
 pub async fn fetch_stream_shard(
     host: &str,
     remote: &str,
@@ -84,15 +79,12 @@ pub async fn fetch_stream_shard(
     }
     let expected = entries.into_iter().collect::<HashMap<_, _>>();
     let request_path = format!("/stream-batch/{}", encode_path(remote));
-    let request = StreamRequest {
-        path: request_path,
-        body: request_body,
-    };
     tokio::task::spawn_blocking(move || {
         fetch_stream_blocking(
             stream,
             &host_owned,
-            request,
+            &request_path,
+            &request_body,
             &remote_owned,
             &target_owned,
             expected,
@@ -106,7 +98,8 @@ pub async fn fetch_stream_shard(
 fn fetch_stream_blocking(
     mut stream: TcpStream,
     host: &str,
-    request: StreamRequest,
+    request_path: &str,
+    request_body: &[u8],
     remote: &str,
     target: &Path,
     mut expected: HashMap<String, u64>,
@@ -116,18 +109,19 @@ fn fetch_stream_blocking(
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
-    let body = request.body;
-    let path = request.path;
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request_body.len()
     );
     stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
+    stream.write_all(request_body)?;
 
     let status = read_response_head(&mut stream)?;
     if status != 200 {
-        return Err(Error::Http { status, path });
+        return Err(Error::Http {
+            status,
+            path: request_path.to_string(),
+        });
     }
 
     std::fs::create_dir_all(target)?;
