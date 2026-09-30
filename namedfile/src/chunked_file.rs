@@ -1,7 +1,6 @@
-use std::cmp;
 use std::fmt::{self, Debug, Formatter};
 use std::fs::File;
-use std::io::{self, Error as IoError, ErrorKind, Read, Result as IoResult, Seek};
+use std::io::{Error as IoError, Result as IoResult};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -10,11 +9,11 @@ use bytes::Bytes;
 use futures_util::stream::Stream;
 
 /// Internal state machine for [`ChunkedFile`].
-pub(crate) enum ChunkedState<T> {
+enum ChunkedState {
     /// Holding the file, ready to start the next read operation.
-    File(Option<T>),
+    Idle,
     /// Waiting for a blocking read operation to complete.
-    Future(tokio::task::JoinHandle<IoResult<(T, Bytes)>>),
+    Future(tokio::task::JoinHandle<IoResult<Bytes>>),
 }
 
 /// A streaming file reader that yields data in configurable chunks.
@@ -28,10 +27,6 @@ pub(crate) enum ChunkedState<T> {
 /// 1. Reading is performed in a blocking thread pool via `spawn_blocking`
 /// 2. Each read operation yields a chunk of up to `buffer_size` bytes
 /// 3. The stream completes when `total_size` bytes have been read
-///
-/// # Type Parameter
-///
-/// - `T`: The file type, which must implement [`Read`], [`Seek`], [`Unpin`], and [`Send`]
 ///
 /// # Example
 ///
@@ -52,54 +47,29 @@ pub(crate) enum ChunkedState<T> {
 ///     }
 /// }
 /// ```
-pub struct ChunkedFile<T> {
-    pub(crate) total_size: u64,
-    pub(crate) read_size: u64,
-    pub(crate) buffer_size: u64,
-    pub(crate) offset: u64,
-    pub(crate) state: ChunkedState<T>,
-}
-/// 惰性复制句柄：只有真正开始读文件时才 `dup`。
-///
-/// `/files` 的正常路径会把响应体整个换成 `sendfile`，此时 `ChunkedFile` 一次都不会被 poll，
-/// 也就不该为它先付一次 `dup` + `close`。
-pub(crate) struct LazyFile {
-    source: Option<Arc<File>>,
-    owned: Option<File>,
+pub struct ChunkedFile {
+    total_size: u64,
+    read_size: u64,
+    buffer_size: u64,
+    offset: u64,
+    file: Arc<File>,
+    state: ChunkedState,
 }
 
-impl LazyFile {
-    pub(crate) fn new(file: Arc<File>) -> Self {
+impl ChunkedFile {
+    /// Creates a reader for `total_size` bytes starting at `offset`.
+    pub(crate) fn new(file: Arc<File>, offset: u64, total_size: u64, buffer_size: u64) -> Self {
         Self {
-            source: Some(file),
-            owned: None,
+            total_size,
+            read_size: 0,
+            buffer_size,
+            offset,
+            file,
+            state: ChunkedState::Idle,
         }
     }
-
-    fn owned(&mut self) -> IoResult<&mut File> {
-        if let Some(source) = self.source.take() {
-            self.owned = Some(source.try_clone()?);
-        }
-        // 与其手写 Some/None 两条分支，不如让 `Option::ok_or_else` 收口
-        self.owned
-            .as_mut()
-            .ok_or_else(|| IoError::other("`LazyFile` has no handle"))
-    }
 }
-
-impl Read for LazyFile {
-    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        self.owned()?.read(buf)
-    }
-}
-
-impl Seek for LazyFile {
-    fn seek(&mut self, pos: io::SeekFrom) -> IoResult<u64> {
-        self.owned()?.seek(pos)
-    }
-}
-
-impl<T> Debug for ChunkedFile<T> {
+impl Debug for ChunkedFile {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ChunkedFile")
             .field("total_size", &self.total_size)
@@ -110,10 +80,7 @@ impl<T> Debug for ChunkedFile<T> {
     }
 }
 
-impl<T> Stream for ChunkedFile<T>
-where
-    T: Read + Seek + Unpin + Send + 'static,
-{
+impl Stream for ChunkedFile {
     type Item = IoResult<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -122,31 +89,26 @@ where
         }
 
         match self.state {
-            ChunkedState::File(ref mut file) => {
-                let mut file = file.take().expect("`ChunkedFile` polled after completion");
-                let max_bytes = cmp::min(
-                    self.total_size.saturating_sub(self.read_size),
-                    self.buffer_size,
-                ) as usize;
+            ChunkedState::Idle => {
+                let max_bytes = self
+                    .total_size
+                    .saturating_sub(self.read_size)
+                    .min(self.buffer_size) as usize;
                 let offset = self.offset;
+                let file = Arc::clone(&self.file);
                 let fut = tokio::task::spawn_blocking(move || {
-                    let mut buf = vec![0u8; max_bytes];
-                    file.seek(io::SeekFrom::Start(offset))?;
-                    let bytes = file.read(&mut buf)?;
-                    buf.truncate(bytes);
-                    if bytes == 0 {
-                        return Err(ErrorKind::UnexpectedEof.into());
-                    }
-                    Ok((file, Bytes::from(buf)))
+                    let mut buf = vec![0_u8; max_bytes];
+                    read_exact_at(&file, &mut buf, offset)?;
+                    Ok(Bytes::from(buf))
                 });
 
                 self.state = ChunkedState::Future(fut);
                 self.poll_next(cx)
             }
             ChunkedState::Future(ref mut fut) => {
-                let (file, bytes) = ready!(Pin::new(fut).poll(cx))
+                let bytes = ready!(Pin::new(fut).poll(cx))
                     .map_err(|_| IoError::other("`ChunkedFile` block error"))??;
-                self.state = ChunkedState::File(Some(file));
+                self.state = ChunkedState::Idle;
 
                 self.offset += bytes.len() as u64;
                 self.read_size += bytes.len() as u64;
@@ -157,32 +119,71 @@ where
     }
 }
 
+/// Reads exactly `buf.len()` bytes without changing the shared file offset.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    file.read_exact_at(buf, offset)
+}
+
+/// Reads exactly `buf.len()` bytes without changing the shared file offset.
+#[cfg(windows)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    use std::os::windows::fs::FileExt as _;
+
+    let mut done = 0;
+    while done < buf.len() {
+        let read = file.seek_read(&mut buf[done..], offset + done as u64)?;
+        if read == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        done += read;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(_file: &File, _buf: &mut [u8], _offset: u64) -> IoResult<()> {
+    Err(IoError::other(
+        "positioned file reads are not supported on this platform",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use futures_util::StreamExt as _;
 
-    #[test]
-    fn lazy_file_duplicates_only_when_it_starts_reading() {
+    #[tokio::test]
+    async fn shared_file_streams_keep_their_offsets() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lazy.txt");
-        std::fs::write(&path, b"hello").unwrap();
+        let path = dir.path().join("shared.bin");
+        let payload: Vec<u8> = (0..100_000_u32).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
 
-        let shared = Arc::new(File::open(&path).unwrap());
-        let mut lazy = LazyFile::new(Arc::clone(&shared));
-        assert!(lazy.owned.is_none(), "构造时不应复制句柄");
+        let file = Arc::new(File::open(&path).unwrap());
+        let mut first = ChunkedFile::new(Arc::clone(&file), 0, 4096, 4096);
+        let mut second = ChunkedFile::new(Arc::clone(&file), 8192, 4096, 4096);
 
-        let mut text = String::new();
-        lazy.read_to_string(&mut text).unwrap();
-        assert_eq!(text, "hello");
-        assert!(lazy.owned.is_some(), "开始读之后才复制句柄");
+        let (first, second) = futures_util::future::join(first.next(), second.next()).await;
+        assert_eq!(first.unwrap().unwrap(), &payload[..4096]);
+        assert_eq!(second.unwrap().unwrap(), &payload[8192..12_288]);
+    }
 
-        // `dup(2)` 出来的句柄与源句柄共享同一个 file description，偏移量并不独立：共用同一个
-        // 缓存 fd 的两个响应会互相搬动偏移量（sendfile 那侧带显式 offset，才不受影响）
-        assert_eq!(lazy.seek(io::SeekFrom::Start(1)).unwrap(), 1);
-        let mut rest = String::new();
-        lazy.read_to_string(&mut rest).unwrap();
-        assert_eq!(rest, "ello");
+    #[tokio::test]
+    async fn stream_reads_a_file_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        let mut stream = ChunkedFile::new(Arc::new(File::open(&path).unwrap()), 0, 11, 5);
+
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(out, b"hello world");
     }
 }
