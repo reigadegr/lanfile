@@ -90,22 +90,18 @@ pub fn folder_name(dir: &Path) -> String {
         .map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned())
 }
 
-/// 深度优先遍历目录树，把每个条目交给 `on_entry`；`on_entry` 返回 `false` 时提前停止。
-/// `RawDir` 零分配遍历 + `d_type` 免 stat；与 /api/list 一致包含 dotfile、跳过符号链接。
-/// 每个目录的条目按名称排序，保证 zip 内顺序确定。
-/// 目录不可读（无权限等）时跳过该目录，不中断整个打包。
-pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) {
-    walk_inner(dir, prefix, on_entry);
-}
-
 /// 按名称排序目录条目，保证 zip 内顺序确定；两个平台的实现共用。
 fn sort_by_name<T>(entries: &mut [(T, String)]) {
     entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 }
 
+/// 深度优先遍历目录树，把每个条目交给 `on_entry`；`on_entry` 返回 `false` 时提前停止。
+/// `RawDir` 零分配遍历 + `d_type` 免 stat；与 /api/list 一致包含 dotfile、跳过符号链接。
+/// 每个目录的条目按名称排序，保证 zip 内顺序确定。
+/// 目录不可读（无权限等）时跳过该目录，不中断整个打包。
+/// 返回 `false` 表示回调要求提前停止。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-/// 递归实现，返回 `false` 表示应停止遍历。
-fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
+pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
     let Ok(dirfd) = rfs::openat(
         rfs::CWD,
         dir,
@@ -153,7 +149,7 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         };
 
         let keep_going = if actual_ft.is_dir() {
-            walk_inner(&path, &zip_name, on_entry)
+            walk(&path, &zip_name, on_entry)
         } else if actual_ft.is_file() {
             // 相对 dirfd 打开：一个组件的路径解析，省掉从 `/` 开始的逐层查找。
             // 失败就跳过这个文件，不中断整棵树。
@@ -185,9 +181,13 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
     true
 }
 
+/// 深度优先遍历目录树，把每个条目交给 `on_entry`；`on_entry` 返回 `false` 时提前停止。
+/// 每个目录的条目按名称排序，保证 zip 内顺序确定。
+/// 目录不可读（无权限等）时跳过该目录，不中断整个打包。
+/// 返回 `false` 表示回调要求提前停止。
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 /// 非 Linux/Android（Windows、macOS 等）下的递归遍历：`rustix::fs` 的 Linux 专用接口不可用，改用 `std::fs`，行为与 Linux 版本一致。
-fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
+pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) -> bool {
     // 目录不可读时不产出目录条目，与 Linux 版本 openat 失败时的行为保持一致
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return true;
@@ -216,7 +216,7 @@ fn walk_inner(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool
         };
         let ft = metadata.file_type();
         let keep_going = if ft.is_dir() {
-            walk_inner(&path, &zip_name, on_entry)
+            walk(&path, &zip_name, on_entry)
         } else if ft.is_file() {
             match File::open(&path) {
                 Ok(file) => on_entry(Entry::File {
