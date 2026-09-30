@@ -78,30 +78,7 @@ pub async fn list_entries(
     host: &str,
     remote: &str,
 ) -> Result<Vec<RemoteEntry>, Error> {
-    let path = if remote.is_empty() {
-        "/api/list".to_string()
-    } else {
-        format!("/api/list/{}", encode_path(remote))
-    };
-    let (reader, declared) = http_get(pool, host, &path).await?;
-    let len = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
-    // 列表正文就几十 KB 出头，这里卡的是整段读完的总时长（不是空闲）。用 `take` 把读取截在
-    // 声明的长度上，而不是先按这个长度开一块：对端报的数在读懂之前都不算数。
-    let mut limited = reader.take(len);
-    let mut body = Vec::new();
-    tokio::time::timeout(READ_TIMEOUT, limited.read_to_end(&mut body))
-        .await
-        .map_err(|_| Error::Timeout {
-            phase: "读取目录列表",
-        })??;
-    if body.len() as u64 != len {
-        return Err(Error::Truncated {
-            remote: remote.to_string(),
-            want: len,
-            got: body.len() as u64,
-        });
-    }
-    pool.release(limited.into_inner());
+    let body = fetch_json_body(pool, host, remote, "/api/list", "读取目录列表").await?;
     Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
@@ -111,20 +88,32 @@ pub async fn fetch_manifest(
     host: &str,
     remote: &str,
 ) -> Result<Vec<ManifestEntry>, Error> {
+    let body = fetch_json_body(pool, host, remote, "/api/manifest", "读取目录清单").await?;
+    Ok(serde_json::from_slice::<ManifestResponse>(&body)?.entries)
+}
+
+/// 取一个 JSON 端点的正文：请求、超时、截断校验与连接归还在这里共用。
+async fn fetch_json_body(
+    pool: &Pool,
+    host: &str,
+    remote: &str,
+    endpoint: &str,
+    phase: &'static str,
+) -> Result<Vec<u8>, Error> {
     let path = if remote.is_empty() {
-        "/api/manifest".to_string()
+        endpoint.to_string()
     } else {
-        format!("/api/manifest/{}", encode_path(remote))
+        format!("{endpoint}/{}", encode_path(remote))
     };
     let (reader, declared) = http_get(pool, host, &path).await?;
     let len = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
+    // 用 `take` 把读取截在声明的长度上，而不是先按这个长度开一块：
+    // 对端报的数在完整收到并校验之前都不算数。
     let mut limited = reader.take(len);
     let mut body = Vec::new();
     tokio::time::timeout(READ_TIMEOUT, limited.read_to_end(&mut body))
         .await
-        .map_err(|_| Error::Timeout {
-            phase: "读取目录清单",
-        })??;
+        .map_err(|_| Error::Timeout { phase })??;
     if body.len() as u64 != len {
         return Err(Error::Truncated {
             remote: remote.to_string(),
@@ -133,7 +122,7 @@ pub async fn fetch_manifest(
         });
     }
     pool.release(limited.into_inner());
-    Ok(serde_json::from_slice::<ManifestResponse>(&body)?.entries)
+    Ok(body)
 }
 
 /// 一次抓取里正文走的搬运方式。
