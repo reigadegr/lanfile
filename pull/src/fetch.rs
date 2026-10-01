@@ -30,13 +30,20 @@ const NO_CONTENT_LENGTH: &str = "响应没有 Content-Length，无法确定正�
 pub struct ManifestEntry {
     pub path: String,
     #[serde(rename = "type")]
-    kind: String,
+    kind: ManifestKind,
     pub size: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ManifestKind {
+    Dir,
+    File,
+}
+
 impl ManifestEntry {
-    pub fn is_dir(&self) -> bool {
-        self.kind == "dir"
+    pub const fn is_dir(&self) -> bool {
+        matches!(self.kind, ManifestKind::Dir)
     }
 }
 
