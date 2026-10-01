@@ -509,11 +509,12 @@ mod tests {
                     panic!("第一次应当打开成功");
                 };
                 assert!(cached.is_none(), "第一次不该命中");
-                let named = NamedFile::builder(fixture.root.join("ok.txt"))
-                    .preload_threshold(0)
-                    .build_from_file_with_metadata(Arc::clone(&file), metadata.clone())
-                    .await
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let named =
+                    NamedFile::builder_shared(Arc::from(fixture.root.join("ok.txt").as_path()))
+                        .preload_threshold(0)
+                        .build_from_file_with_metadata(Arc::clone(&file), metadata.clone())
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
                 let Ok(etag) = "\"ok-1\"".parse::<ETag>() else {
                     unreachable!("写死的 ETag 应当能解析");
                 };

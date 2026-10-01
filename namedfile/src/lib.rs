@@ -1,58 +1,9 @@
-//! Vendored copy of `salvo_core::fs::NamedFile` without its build-time
-//! blocking-pool hop.
-//!
-//! 本 crate 是 `salvo_core-1.0.0/src/fs/named_file.rs`（以及 `fs.rs` 里的
-//! `ChunkedFile`）的拷贝。行为改动是构建阶段的 `spawn_blocking` 换成同步调用；
-//! 在此之上为本项目加了几处接口（[`FileMeta`]、`Arc<File>`/`Arc<Path>` 共享、
-//! `build_from_file_with_metadata`、[`NamedFile::set_etag`]、`builder_shared`、
-//! `content_type()` 返回 `Arc<Mime>`），这些行与上游不再逐行一致，其余是上游
-//! 的逻辑。
-//!
-//! This crate is a copy of `salvo_core-1.0.0/src/fs/named_file.rs` (plus the
-//! `ChunkedFile` type from `fs.rs`). The behavioural change is that the
-//! build-time `spawn_blocking` becomes synchronous; on top of that this
-//! project added a few interfaces ([`FileMeta`], `Arc<File>`/`Arc<Path>`
-//! sharing, `build_from_file_with_metadata`, [`NamedFile::set_etag`],
-//! `builder_shared`, and `content_type()` returning `Arc<Mime>`), so those lines
-//! no longer match upstream while the rest is upstream's logic.
-//!
-//! 上游 `build()` 把 open/metadata/预读放进 `spawn_blocking`。流式正文仍由
-//! `ChunkedFile` 按块派发到 blocking pool。
-//! 本项目的 `/files` 是热路径，而 tokio 的 blocking pool 只有一把全局
-//! `Mutex` + `Condvar`，压测显示这次派发占掉每请求约 4 次 futex 等待，
-//! 比它们省下的阻塞还贵。
-//!
-//! Upstream `build()` wraps open/metadata/preread in `spawn_blocking`; streamed
-//! bodies still use `ChunkedFile` and its per-chunk blocking dispatch.
-//! `/files` is this project's hot path, and tokio's blocking
-//! pool has a single global `Mutex` plus `Condvar`; benchmarking shows the
-//! build dispatch costs about four futex waits per request, more than the
-//! blocking they avoid.
-//!
-//! 因此 [`NamedFile`] 直接持有 `std::fs::File`，不再包一层 `tokio::fs::File`，
-//! 也不再实现 `Writer`/`Deref`；其余行为（ETag、Last-Modified、
-//! Content-Disposition、Range/206、304、MIME 与字符集嗅探）与上游一致。
-//!
-//! [`NamedFile`] therefore holds a `std::fs::File` directly instead of wrapping
-//! a `tokio::fs::File`, and no longer implements `Writer`/`Deref`. Everything
-//! else upstream does (ETag, Last-Modified, Content-Disposition, Range/206,
-//! 304, MIME and charset sniffing) is unchanged.
-
-// 本 crate 绝大部分是 salvo 源码的拷贝，不按本项目的 clippy 规则整改：
-// 一旦逐条修 lint 就无法再和上游逐行比对，以后同步上游改动会变得不可靠。
-#![allow(
-    clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::expect_used,
-    clippy::unwrap_used
-)]
+//! 面向本项目的静态文件响应类型。构建文件时不经过 blocking pool，正文由
+//! [`NamedFile`] 或 sendfile 升级路径写出。
 
 mod chunked_file;
 
-use std::borrow::Cow;
 use std::cmp;
-use std::ffi::OsStr;
 use std::fs::{File, Metadata};
 #[cfg(not(unix))]
 use std::io::Read as StdRead;
@@ -62,7 +13,7 @@ use std::io::{Seek as StdSeek, SeekFrom};
 use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,12 +23,12 @@ use mime::Mime;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use salvo::http::body::ResBody;
 use salvo::http::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH,
-    LAST_MODIFIED, RANGE, X_CONTENT_TYPE_OPTIONS,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_TYPE, IF_NONE_MATCH, LAST_MODIFIED, RANGE,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use salvo::http::headers::*;
 use salvo::http::mime::{detect_text_mime, fill_mime_charset_if_need, is_charset_required_mime};
-use salvo::http::{HttpRange, Response, StatusCode, StatusError};
+use salvo::http::{HttpRange, Response, StatusCode};
 use salvo::{Error, Result};
 
 use crate::chunked_file::ChunkedFile;
@@ -238,78 +189,35 @@ impl FileMeta {
 /// - HTTP Range request support for partial content
 /// - Chunked transfer for large files
 ///
-/// # Opening Files
-///
-/// Files can be opened directly or through a builder:
-///
-/// ```
-/// use lanfile_namedfile::NamedFile;
-///
-/// async fn examples() {
-///     // Simple open
-///     let file = NamedFile::open("document.pdf").await;
-///
-///     // Builder pattern for more control
-///     let file = NamedFile::builder("document.pdf")
-///         .attached_name("report.pdf")
-///         .buffer_size(65536)
-///         .preload_threshold(262144)
-///         .build()
-///         .await;
-/// }
-/// ```
-///
-/// # Using as a Response
-///
-/// Call [`NamedFile::send`] with the request headers and the response to write.
-/// Unlike upstream, this crate does not implement `Writer`:
-///
-/// ```ignore
-/// let named_file = NamedFile::builder(path).build().await?;
-/// named_file.send(req.headers(), res).await;
-/// ```
+/// 项目通过 `builder_shared` 传入已打开的文件与元数据，再调用 `send` 或
+/// `send_head` 写入响应。
 ///
 /// # Content-Disposition
 ///
 /// By default, text, images, video, and audio files are served with
 /// `Content-Disposition: inline`, while other files use `attachment`.
-/// Use [`NamedFileBuilder::attached_name`] to force a download with a specific filename.
-///
 /// XML-based documents are the exception: `image/svg+xml`, `text/xml`, `text/xsl`
 /// and anything else carrying an `xml` subtype or a `+xml` suffix default to
 /// `attachment` even though their top-level type is `image` or `text`, because a
 /// browser rendering one as a document will run any script it contains in the
-/// serving origin. Pass [`NamedFileBuilder::disposition_type`] to override this
-/// for content you trust.
-///
-/// # Security Headers
-///
-/// Responses carry `X-Content-Type-Options: nosniff` by default so a browser
-/// cannot reinterpret a file as a more dangerous type than its `Content-Type`
-/// claims. See [`NamedFileBuilder::use_content_type_options`].
+/// serving origin.
 ///
 /// # Caching Headers
 ///
 /// By default, `NamedFile` generates `ETag` and `Last-Modified` headers
 /// and respects conditional request headers (`If-None-Match`, `If-Modified-Since`, etc.).
-/// These can be disabled via [`use_etag()`](NamedFile::use_etag) and
-/// [`use_last_modified()`](NamedFile::use_last_modified).
+/// 构建时可以通过 builder 选项关闭。
 #[derive(Debug)]
 pub struct NamedFile {
     path: Arc<Path>,
-    /// Overrides the name `Content-Disposition` reports, when the bytes come from
-    /// a different path than the requested resource.
-    disposition_name: Option<String>,
     /// 共享持有：缓存、响应体与 sendfile 升级共用同一个 fd，每请求因此不必再 `dup`。
     /// sendfile 带显式 offset，不会移动共享的文件偏移量，所以并发共用是安全的。
     file: Arc<File>,
     modified: Option<SystemTime>,
-    buffer_size: u64,
     metadata: FileMeta,
     flags: BitFlags<Flag>,
     content_type: Arc<Mime>,
     content_disposition: Option<HeaderValue>,
-    content_encoding: Option<HeaderValue>,
     /// Pre-read content for small files, avoiding ChunkedFile + spawn_blocking overhead.
     preread: Option<Bytes>,
     /// 调用方已经算好的 `ETag`：命中缓存时由 [`NamedFile::set_etag`] 给出，
@@ -317,76 +225,15 @@ pub struct NamedFile {
     etag_override: Option<ETag>,
 }
 
-/// Builder for constructing [`NamedFile`] instances with custom configuration.
-///
-/// The builder pattern allows customizing various aspects of file serving:
-///
-/// - MIME content type
-/// - Content-Disposition (inline vs attachment)
-/// - Download filename
-/// - Buffer size for chunked reading
-/// - Preload threshold for small-file responses
-/// - ETag and Last-Modified header generation
-///
-/// # Example
-///
-/// ```ignore
-/// use lanfile_namedfile::NamedFile;
-///
-/// let file = NamedFile::builder("./data/export.csv")
-///     .attached_name("data-export-2024.csv")  // Force download with this name
-///     .content_type("text/csv".parse().unwrap())
-///     .buffer_size(131072)  // 128KB chunks
-///     .preload_threshold(262144)  // Preload files up to 256KB
-///     .use_etag(true)
-///     .build()
-///     .await?;
-/// ```
+/// [`NamedFile`] 的构建器。
 #[derive(Clone, Debug)]
 pub struct NamedFileBuilder {
     path: Arc<Path>,
-    attached_name: Option<String>,
-    disposition_name: Option<String>,
-    disposition_type: Option<String>,
     content_type: Option<Arc<Mime>>,
-    content_encoding: Option<String>,
-    buffer_size: Option<u64>,
     preload_threshold: Option<u64>,
     flags: BitFlags<Flag>,
 }
 impl NamedFileBuilder {
-    /// Sets attached filename and returns `Self`.
-    #[inline]
-    #[must_use]
-    pub fn attached_name<T: Into<String>>(mut self, attached_name: T) -> Self {
-        self.attached_name = Some(attached_name.into());
-        self.flags.insert(Flag::ContentDisposition);
-        self
-    }
-
-    /// Sets the file name used in `Content-Disposition` without forcing the
-    /// disposition to `attachment`, and returns `Self`.
-    ///
-    /// Use this when the bytes are read from a different path than the resource
-    /// the client asked for, so a download is saved under the requested name
-    /// rather than the name of the file on disk. [`Self::attached_name`] sets the
-    /// same name but also forces `attachment`.
-    #[inline]
-    #[must_use]
-    pub fn disposition_name<T: Into<String>>(mut self, disposition_name: T) -> Self {
-        self.disposition_name = Some(disposition_name.into());
-        self
-    }
-
-    /// Sets disposition encoding and returns `Self`.
-    #[inline]
-    #[must_use]
-    pub fn disposition_type<T: Into<String>>(mut self, disposition_type: T) -> Self {
-        self.disposition_type = Some(disposition_type.into());
-        self.flags.insert(Flag::ContentDisposition);
-        self
-    }
-
     /// Disable `Content-Disposition` header.
     ///
     /// By default, the `Content-Disposition` header is enabled.
@@ -403,30 +250,11 @@ impl NamedFileBuilder {
         self
     }
 
-    /// Sets content encoding and returns `Self`.
-    #[inline]
-    #[must_use]
-    pub fn content_encoding<T: Into<String>>(mut self, content_encoding: T) -> Self {
-        self.content_encoding = Some(content_encoding.into());
-        self
-    }
-
-    /// Sets chunk buffer size and returns `Self`.
-    ///
-    /// This controls the maximum chunk size used when a file is streamed. It does not change the
-    /// small-file preload threshold. Use [`Self::preload_threshold`] to configure that separately.
-    #[inline]
-    #[must_use]
-    pub fn buffer_size(mut self, buffer_size: u64) -> Self {
-        self.buffer_size = Some(buffer_size);
-        self
-    }
-
     /// Sets small-file preload threshold and returns `Self`.
     ///
     /// Files whose size is less than or equal to this threshold are read during build and sent from
-    /// memory. Larger files are streamed in chunks using [`Self::buffer_size`]. Set this to `0` to
-    /// disable preloading for non-empty files.
+    /// memory. Larger files are streamed in chunks. Set this to `0` to disable
+    /// preloading for non-empty files.
     #[inline]
     #[must_use]
     pub fn preload_threshold(mut self, threshold: u64) -> Self {
@@ -462,48 +290,6 @@ impl NamedFileBuilder {
         self
     }
 
-    /// Specifies whether to send `X-Content-Type-Options: nosniff` or not.
-    ///
-    /// Default is true. Turn this off only when a client depends on MIME
-    /// sniffing to interpret a file whose extension does not describe it.
-    #[inline]
-    #[must_use]
-    pub fn use_content_type_options(mut self, value: bool) -> Self {
-        if value {
-            self.flags.insert(Flag::ContentTypeOptions);
-        } else {
-            self.flags.remove(Flag::ContentTypeOptions);
-        }
-        self
-    }
-
-    /// Build a new `NamedFile` and send it.
-    pub async fn send(self, req_headers: &HeaderMap, res: &mut Response) {
-        if !self.path.exists() {
-            res.render(StatusError::not_found());
-        } else {
-            match self.build().await {
-                Ok(file) => file.send(req_headers, res).await,
-                Err(_) => res.render(StatusError::internal_server_error()),
-            }
-        }
-    }
-
-    /// Build a new [`NamedFile`].
-    pub async fn build(self) -> Result<NamedFile> {
-        self.build_inner(None, None).await
-    }
-
-    /// Build a new [`NamedFile`] from an already-opened file.
-    ///
-    /// The path still names the file: it supplies the extension used for MIME
-    /// inference and the name used in `Content-Disposition`. Use this when the
-    /// caller has already opened the file — for example after resolving it with
-    /// `openat2` — so that build does not open it a second time.
-    pub async fn build_from_file(self, file: File) -> Result<NamedFile> {
-        self.build_inner(Some(Arc::new(file)), None).await
-    }
-
     /// Build a new [`NamedFile`] from an already-opened file and its metadata.
     ///
     /// `metadata` must describe that same open file, so that build skips the
@@ -530,46 +316,21 @@ impl NamedFileBuilder {
         let Self {
             path,
             content_type,
-            content_encoding,
-            buffer_size,
             preload_threshold,
-            disposition_type,
-            attached_name,
-            disposition_name,
             flags,
         } = self;
 
-        let buf_size = buffer_size.unwrap_or(CHUNK_SIZE).max(1);
         let preload_threshold = preload_threshold.unwrap_or(PRELOAD_THRESHOLD);
-
-        // An extension such as `.svgz` names a media type *and* the coding applied
-        // to it. Recover the coding here, because the type alone describes the
-        // decoded document and would leave the response claiming a gzip stream is
-        // an SVG. An explicitly configured encoding always wins.
-        let content_encoding = content_encoding.or_else(|| {
-            path.extension()
-                .and_then(OsStr::to_str)
-                .and_then(extension_content_encoding)
-                .map(ToOwned::to_owned)
-        });
 
         // Determine what charset detection is needed before the blocking call.
         let inferred_mime = content_type
             .clone()
             .or_else(|| mime_infer::from_path(&path).first().map(Arc::new));
-        // When a content encoding is set, the on-disk bytes are the *encoded*
-        // (e.g. gzip) payload of a precompressed sidecar file. Sniffing a charset
-        // or text mime from those compressed bytes yields a bogus result (the
-        // compressed blob is not valid UTF-8), so the wrong `charset=` would be
-        // attached to the `Content-Type` and the client mojibakes the decoded
-        // text. Skip content-based detection in that case.
-        let is_encoded = content_encoding.is_some();
-        let needs_charset = !is_encoded
-            && inferred_mime
-                .as_ref()
-                .map(|m| is_charset_required_mime(m) && m.get_param("charset").is_none())
-                .unwrap_or(false);
-        let needs_detect = !is_encoded && content_type.is_none() && path.extension().is_none();
+        let needs_charset = inferred_mime
+            .as_ref()
+            .map(|m| is_charset_required_mime(m) && m.get_param("charset").is_none())
+            .unwrap_or(false);
+        let needs_detect = content_type.is_none() && path.extension().is_none();
 
         let needs_detection_sample = needs_charset || needs_detect;
 
@@ -686,34 +447,14 @@ impl NamedFileBuilder {
 
         let preread = info.preread.map(Bytes::from);
 
-        let content_encoding = match content_encoding {
-            Some(content_encoding) => Some(
-                content_encoding
-                    .parse::<HeaderValue>()
-                    .map_err(Error::other)?,
-            ),
-            None => None,
-        };
-
-        let mut content_disposition = None;
-        if attached_name.is_some() || disposition_type.is_some() {
-            content_disposition = Some(build_content_disposition(
-                disposition_name_source(disposition_name.as_deref(), &path),
-                &content_type,
-                disposition_type.as_deref(),
-                attached_name.as_deref(),
-            )?);
-        }
+        let content_disposition = Some(build_content_disposition(&path, &content_type)?);
         Ok(NamedFile {
             path,
-            disposition_name,
             file,
             content_type,
             content_disposition,
             modified: info.metadata.modified().ok(),
             metadata: info.metadata,
-            content_encoding,
-            buffer_size: buf_size,
             flags,
             preread,
             etag_override: None,
@@ -748,43 +489,25 @@ fn is_scriptable_xml(content_type: &Mime) -> bool {
         || subtype.eq_ignore_ascii_case("xsl")
 }
 
-/// The path whose file name names the file in `Content-Disposition`.
-///
-/// Normally that is the path on disk, but the two diverge when the bytes come
-/// from somewhere other than the resource that was requested: `StaticDir` serving
-/// the precompressed sidecar `logo.svg.br` for a request for `logo.svg` must
-/// still offer the download as `logo.svg`.
-fn disposition_name_source<'a>(disposition_name: Option<&'a str>, path: &'a Path) -> &'a Path {
-    disposition_name.map_or(path, Path::new)
-}
-
 fn build_content_disposition(
     file_path: impl AsRef<Path>,
     content_type: &Mime,
-    disposition_type: Option<&str>,
-    attached_name: Option<&str>,
 ) -> Result<HeaderValue> {
-    let disposition_type = disposition_type.unwrap_or_else(|| {
-        if attached_name.is_some() || is_scriptable_xml(content_type) {
-            "attachment"
-        } else {
-            match (content_type.type_(), content_type.subtype()) {
-                (mime::IMAGE | mime::TEXT | mime::VIDEO | mime::AUDIO, _)
-                | (_, mime::JAVASCRIPT | mime::JSON) => "inline",
-                _ => "attachment",
-            }
+    let disposition_type = if is_scriptable_xml(content_type) {
+        "attachment"
+    } else {
+        match (content_type.type_(), content_type.subtype()) {
+            (mime::IMAGE | mime::TEXT | mime::VIDEO | mime::AUDIO, _)
+            | (_, mime::JAVASCRIPT | mime::JSON) => "inline",
+            _ => "attachment",
         }
-    });
+    };
     let content_disposition = if disposition_type == "attachment" {
-        let attached_name = match attached_name {
-            Some(attached_name) => Cow::Borrowed(attached_name),
-            None => file_path
-                .as_ref()
-                .file_name()
-                .map(|file_name| file_name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".into())
-                .into(),
-        };
+        let attached_name = file_path
+            .as_ref()
+            .file_name()
+            .map(|file_name| file_name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
         let quoted_filename = escape_quoted_filename(&attached_name);
         if quoted_filename == attached_name {
             format!(r#"attachment; filename="{quoted_filename}""#)
@@ -821,44 +544,7 @@ fn escape_quoted_filename(filename: &str) -> String {
     escaped
 }
 
-/// Extensions that name a content-coded form of another media type, paired with
-/// the coding they imply.
-///
-/// `.gz` and `.tgz` are deliberately absent: there the gzip stream is the
-/// representation being served, not a coding applied to something else.
-const CONTENT_CODED_EXTS: &[(&str, &str)] = &[
-    ("svgz", "gzip"),
-    // X3D's compressed interchange forms, gzip per ISO/IEC 19776.
-    ("x3dz", "gzip"),
-    ("x3dvz", "gzip"),
-    ("x3dbz", "gzip"),
-];
-
-/// The content coding implied by a file extension.
-///
-/// An extension maps to a single media type, so `mime_infer` reports `.svgz` as
-/// `image/svg+xml` — the type of the document *inside* the gzip stream. Serving
-/// that without also advertising the coding hands the client compressed bytes
-/// labelled as an SVG document, which it cannot render.
-///
-/// [`NamedFile`] applies this when building a response.
-///
-/// The extension is matched case-insensitively, as `mime_infer` matches it.
-#[must_use]
-pub fn extension_content_encoding(ext: &str) -> Option<&'static str> {
-    CONTENT_CODED_EXTS
-        .iter()
-        .find(|(candidate, _)| ext.eq_ignore_ascii_case(candidate))
-        .map(|(_, encoding)| *encoding)
-}
-
 impl NamedFile {
-    /// Creates a new [`NamedFileBuilder`].
-    #[inline]
-    pub fn builder(path: impl Into<PathBuf>) -> NamedFileBuilder {
-        Self::builder_shared(Arc::from(path.into()))
-    }
-
     /// Creates a new [`NamedFileBuilder`] from an already shared path.
     ///
     /// 路径来自缓存的 `Arc<Path>` 时用它：命中路径上不必再拷贝一次路径。
@@ -866,45 +552,10 @@ impl NamedFile {
     pub fn builder_shared(path: Arc<Path>) -> NamedFileBuilder {
         NamedFileBuilder {
             path,
-            attached_name: None,
-            disposition_name: None,
-            disposition_type: None,
             content_type: None,
-            content_encoding: None,
-            buffer_size: None,
             preload_threshold: None,
             flags: BitFlags::default(),
         }
-    }
-
-    /// Attempts to open a file in read-only mode.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use lanfile_namedfile::NamedFile;
-    /// # async fn open() {
-    /// let file = NamedFile::open("foo.txt").await;
-    /// # }
-    /// ```
-    #[inline]
-    pub async fn open<P>(path: P) -> Result<Self>
-    where
-        P: Into<PathBuf> + Send,
-    {
-        Self::builder(path).build().await
-    }
-
-    /// Returns reference to the underlying `File` object.
-    #[inline]
-    pub fn file(&self) -> &File {
-        self.file.as_ref()
-    }
-
-    /// Retrieve the path of this file.
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Get content type value.
@@ -912,18 +563,7 @@ impl NamedFile {
     pub fn content_type(&self) -> Arc<Mime> {
         Arc::clone(&self.content_type)
     }
-    /// Sets the MIME Content-Type for serving this file. By default
-    /// the Content-Type is inferred from the filename extension.
-    #[inline]
-    pub fn set_content_type(&mut self, content_type: mime::Mime) {
-        self.content_type = Arc::new(content_type);
-    }
 
-    /// Get Content-Disposition value.
-    #[inline]
-    pub fn content_disposition(&self) -> Option<&HeaderValue> {
-        self.content_disposition.as_ref()
-    }
     /// Sets the `Content-Disposition` for serving this file. This allows
     /// changing the inline/attachment disposition as well as the filename
     /// sent to the peer.
@@ -945,30 +585,6 @@ impl NamedFile {
     #[inline]
     pub fn disable_content_disposition(&mut self) {
         self.flags.remove(Flag::ContentDisposition);
-    }
-
-    /// Specifies whether to send `X-Content-Type-Options: nosniff` or not.
-    ///
-    /// Default is true. Turn this off only when a client depends on MIME
-    /// sniffing to interpret a file whose extension does not describe it.
-    #[inline]
-    pub fn use_content_type_options(&mut self, value: bool) {
-        if value {
-            self.flags.insert(Flag::ContentTypeOptions);
-        } else {
-            self.flags.remove(Flag::ContentTypeOptions);
-        }
-    }
-
-    /// Get content encoding value reference.
-    #[inline]
-    pub fn content_encoding(&self) -> Option<&HeaderValue> {
-        self.content_encoding.as_ref()
-    }
-    /// Sets content encoding for serving this file
-    #[inline]
-    pub fn set_content_encoding(&mut self, content_encoding: HeaderValue) {
-        self.content_encoding = Some(content_encoding);
     }
 
     /// Get ETag value.
@@ -1013,18 +629,6 @@ impl NamedFile {
             }
         })
     }
-    /// Specifies whether to use ETag or not.
-    ///
-    /// Default is true.
-    #[inline]
-    pub fn use_etag(&mut self, value: bool) {
-        if value {
-            self.flags.insert(Flag::Etag);
-        } else {
-            self.flags.remove(Flag::Etag);
-        }
-    }
-
     /// 复用调用方已经算好的 `ETag`。
     ///
     /// `ETag` 只由元数据（inode、长度、mtime）决定，调用方按同一份元数据把它缓存下来之后，
@@ -1036,7 +640,7 @@ impl NamedFile {
 
     /// Get last modified value.
     #[inline]
-    pub fn last_modified(&self) -> Option<SystemTime> {
+    fn last_modified(&self) -> Option<SystemTime> {
         self.modified
     }
 
@@ -1050,17 +654,6 @@ impl NamedFile {
             None
         } else {
             Some(mtime)
-        }
-    }
-    /// Specifies whether to use Last-Modified or not.
-    ///
-    /// Default is true.
-    #[inline]
-    pub fn use_last_modified(&mut self, value: bool) {
-        if value {
-            self.flags.insert(Flag::LastModified);
-        } else {
-            self.flags.remove(Flag::LastModified);
         }
     }
     /// Consume self and send content to [`Response`].
@@ -1144,12 +737,7 @@ impl NamedFile {
                     .insert(CONTENT_DISPOSITION, content_disposition);
             } else if !res.headers().contains_key(CONTENT_DISPOSITION) {
                 // skip to set CONTENT_DISPOSITION header if it is already set.
-                match build_content_disposition(
-                    disposition_name_source(self.disposition_name.as_deref(), &self.path),
-                    effective_content_type,
-                    None,
-                    None,
-                ) {
+                match build_content_disposition(&self.path, effective_content_type) {
                     Ok(content_disposition) => {
                         res.headers_mut()
                             .insert(CONTENT_DISPOSITION, content_disposition);
@@ -1184,10 +772,6 @@ impl NamedFile {
             .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
         let mut length = self.metadata.len();
-        if let Some(content_encoding) = &self.content_encoding {
-            res.headers_mut()
-                .insert(CONTENT_ENCODING, content_encoding.clone());
-        }
         // Conditional request handling must precede Range processing: per RFC 7232
         // a `304 Not Modified` / `412 Precondition Failed` takes priority over the
         // `206`/`416` produced by a Range request.
@@ -1258,7 +842,7 @@ impl NamedFile {
             } else {
                 // 回退到普通响应体：pread 不移动共享 fd 的偏移量。
                 let reader =
-                    ChunkedFile::new(Arc::clone(&self.file), offset, total_size, self.buffer_size);
+                    ChunkedFile::new(Arc::clone(&self.file), offset, total_size, CHUNK_SIZE);
                 res.stream(reader);
             }
         } else {
@@ -1275,8 +859,7 @@ impl NamedFile {
                 res.replace_body(ResBody::Once(preread));
             } else {
                 // 回退到普通响应体：pread 不移动共享 fd 的偏移量。
-                let reader =
-                    ChunkedFile::new(Arc::clone(&self.file), offset, length, self.buffer_size);
+                let reader = ChunkedFile::new(Arc::clone(&self.file), offset, length, CHUNK_SIZE);
                 res.stream(reader);
             }
         }
@@ -1332,15 +915,33 @@ fn none_match(etag: Option<&ETag>, req_headers: &HeaderMap) -> bool {
 mod tests {
     use super::*;
 
+    async fn build(path: &Path) -> NamedFile {
+        let file = File::open(path).expect("open file");
+        let metadata = FileMeta::from_metadata(&file.metadata().expect("read metadata"));
+        NamedFile::builder_shared(Arc::from(path))
+            .build_from_file_with_metadata(Arc::new(file), metadata)
+            .await
+            .expect("build named file")
+    }
+
+    async fn build_preload_zero(path: &Path, content_type: Option<Arc<Mime>>) -> NamedFile {
+        let file = File::open(path).expect("open file");
+        let metadata = FileMeta::from_metadata(&file.metadata().expect("read metadata"));
+        let mut builder = NamedFile::builder_shared(Arc::from(path)).preload_threshold(0);
+        if let Some(content_type) = content_type {
+            builder = builder.content_type(content_type);
+        }
+        builder
+            .build_from_file_with_metadata(Arc::new(file), metadata)
+            .await
+            .expect("build named file")
+    }
+
     #[test]
     fn content_disposition_escapes_quoted_filename() {
-        let value = build_content_disposition(
-            "ignored.txt",
-            &mime::APPLICATION_OCTET_STREAM,
-            None,
-            Some("report\"\\\r\n.txt"),
-        )
-        .unwrap();
+        let value =
+            build_content_disposition("report\"\\\r\n.txt", &mime::APPLICATION_OCTET_STREAM)
+                .unwrap();
 
         assert_eq!(
             value.to_str().unwrap(),
@@ -1349,7 +950,7 @@ mod tests {
     }
 
     fn default_disposition_for(content_type: &Mime) -> String {
-        build_content_disposition("upload.bin", content_type, None, None)
+        build_content_disposition("upload.bin", content_type)
             .expect("build content disposition")
             .to_str()
             .expect("header is ascii")
@@ -1430,60 +1031,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn disposition_name_replaces_the_on_disk_file_name() {
-        // `StaticDir` reads `logo.svg.br` but the client asked for `logo.svg`.
-        let value = build_content_disposition(
-            disposition_name_source(Some("logo.svg"), Path::new("/srv/assets/logo.svg.br")),
-            &mime::IMAGE_SVG,
-            None,
-            None,
-        )
-        .expect("build content disposition");
-        assert_eq!(
-            value.to_str().expect("header is ascii"),
-            r#"attachment; filename="logo.svg""#
-        );
-    }
-
-    #[test]
-    fn attached_name_outranks_disposition_name() {
-        let value = build_content_disposition(
-            disposition_name_source(Some("logo.svg"), Path::new("logo.svg.br")),
-            &mime::IMAGE_SVG,
-            None,
-            Some("chosen.svg"),
-        )
-        .expect("build content disposition");
-        assert_eq!(
-            value.to_str().expect("header is ascii"),
-            r#"attachment; filename="chosen.svg""#
-        );
-    }
-
-    #[test]
-    fn disposition_name_falls_back_to_the_path() {
-        let value = build_content_disposition(
-            disposition_name_source(None, Path::new("/srv/assets/logo.svg")),
-            &mime::IMAGE_SVG,
-            None,
-            None,
-        )
-        .expect("build content disposition");
-        assert_eq!(
-            value.to_str().expect("header is ascii"),
-            r#"attachment; filename="logo.svg""#
-        );
-    }
-
-    #[test]
-    fn explicit_disposition_type_overrides_xml_default() {
-        // Serving trusted SVG assets inline stays possible.
-        let value = build_content_disposition("logo.svg", &mime::IMAGE_SVG, Some("inline"), None)
-            .expect("build content disposition");
-        assert_eq!(value.to_str().expect("header is ascii"), "inline");
-    }
-
     #[tokio::test]
     async fn svg_is_served_as_attachment_with_nosniff() {
         use std::io::Write as _;
@@ -1498,10 +1045,7 @@ mod tests {
         .expect("write svg");
         file.flush().expect("flush");
 
-        let named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
+        let named = build(file.path()).await;
         // The file must be recognised *as* an SVG, otherwise this test would also
         // pass on an unidentified file falling back to `application/octet-stream`.
         assert_eq!(*named.content_type(), mime::IMAGE_SVG);
@@ -1528,155 +1072,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_content_type_controls_default_disposition() {
-        use std::io::Write as _;
-
-        let mut file = tempfile::Builder::new()
-            .suffix(".txt")
-            .tempfile()
-            .expect("create temp file");
-        file.write_all(b"plain text").expect("write text");
-        file.flush().expect("flush");
-
-        for content_type in ["image/svg+xml", "invalid"] {
-            let named = NamedFile::builder(file.path())
-                .build()
-                .await
-                .expect("build named file");
-            assert_eq!(named.content_type().type_(), mime::TEXT);
-            assert_eq!(named.content_type().subtype(), mime::PLAIN);
-
-            let mut res = Response::new();
-            res.headers_mut()
-                .insert(CONTENT_TYPE, content_type.parse().expect("header value"));
-            named.send(&HeaderMap::new(), &mut res).await;
-
-            let disposition = res
-                .headers()
-                .get(CONTENT_DISPOSITION)
-                .expect("content-disposition is set")
-                .to_str()
-                .expect("header is ascii");
-            assert!(
-                disposition.starts_with("attachment"),
-                "response type `{content_type}` produced `{disposition}`"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn safe_response_content_type_can_keep_default_disposition_inline() {
-        use std::io::Write as _;
-
-        let mut file = tempfile::Builder::new()
-            .suffix(".svg")
-            .tempfile()
-            .expect("create temp file");
-        file.write_all(br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#)
-            .expect("write svg");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
-        assert_eq!(*named.content_type(), mime::IMAGE_SVG);
-
-        let mut res = Response::new();
-        res.headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
-        named.send(&HeaderMap::new(), &mut res).await;
-
-        assert_eq!(
-            res.headers()
-                .get(CONTENT_DISPOSITION)
-                .expect("content-disposition is set"),
-            "inline"
-        );
-    }
-
-    #[tokio::test]
-    async fn precompressed_file_does_not_sniff_charset_from_encoded_bytes() {
-        use std::io::Write as _;
-
-        // Simulate a `.js.gz` sidecar: the on-disk bytes are a gzip payload, which
-        // is not valid UTF-8. Without the fix, charset detection runs on these
-        // compressed bytes and attaches a bogus `charset=` to the text/javascript
-        // content type, causing the client to mojibake the decoded source.
-        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
-        file.write_all(&[
-            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xab, 0xe2, 0x80, 0x9c,
-            0xc3, 0xa9, 0xb4, 0xd6, 0xfe, 0x00,
-        ])
-        .expect("write gzip-like bytes");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .content_type(Arc::new("text/javascript".parse().expect("parse mime")))
-            .content_encoding("gzip")
-            .build()
-            .await
-            .expect("build named file");
-
-        // No charset must be sniffed from the encoded payload.
-        assert_eq!(named.content_type().get_param("charset"), None);
-        assert_eq!(
-            named.content_encoding().map(|v| v.to_str().unwrap()),
-            Some("gzip")
-        );
-    }
-
-    #[tokio::test]
-    async fn buffer_size_does_not_raise_preload_threshold() {
-        use std::io::Write as _;
-
-        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
-        let bytes = vec![b'a'; (PRELOAD_THRESHOLD + 1) as usize];
-        file.write_all(&bytes).expect("write file");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .buffer_size(PRELOAD_THRESHOLD * 2)
-            .build()
-            .await
-            .expect("build named file");
-
-        assert_eq!(named.buffer_size, PRELOAD_THRESHOLD * 2);
-        assert!(named.preread.is_none());
-    }
-
-    #[tokio::test]
-    async fn preload_threshold_can_be_configured() {
-        use std::io::Write as _;
-
-        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
-        let bytes = vec![b'a'; (PRELOAD_THRESHOLD + 1) as usize];
-        file.write_all(&bytes).expect("write file");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .preload_threshold(PRELOAD_THRESHOLD + 1)
-            .build()
-            .await
-            .expect("build named file");
-
-        assert_eq!(
-            named.preread.as_ref().map(Bytes::len),
-            Some((PRELOAD_THRESHOLD + 1) as usize)
-        );
-    }
-
-    #[tokio::test]
     async fn preload_threshold_zero_still_detects_extensionless_text_mime() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let path = temp_dir.path().join("README");
         std::fs::write(&path, b"plain text content").expect("write extensionless file");
 
-        let named = NamedFile::builder(&path)
-            .preload_threshold(0)
-            .build()
-            .await
-            .expect("build named file");
+        let named = build_preload_zero(&path, None).await;
 
         assert_eq!(named.content_type().type_(), mime::TEXT);
         assert_eq!(named.content_type().subtype(), mime::PLAIN);
@@ -1689,11 +1090,7 @@ mod tests {
         let path = temp_dir.path().join("data.json");
         std::fs::write(&path, br#"{"message":"hello"}"#).expect("write json file");
 
-        let named = NamedFile::builder(&path)
-            .preload_threshold(0)
-            .build()
-            .await
-            .expect("build named file");
+        let named = build_preload_zero(&path, None).await;
 
         assert_eq!(named.content_type().type_(), mime::APPLICATION);
         assert_eq!(named.content_type().subtype(), mime::JSON);
@@ -1716,12 +1113,7 @@ mod tests {
         let path = temp_dir.path().join("hello.txt");
         std::fs::write(&path, b"hello").expect("write file");
 
-        let named = NamedFile::builder(&path)
-            .content_type(Arc::new(mime::TEXT_PLAIN))
-            .preload_threshold(0)
-            .build()
-            .await
-            .expect("build named file");
+        let named = build_preload_zero(&path, Some(Arc::new(mime::TEXT_PLAIN))).await;
         let mut res = Response::new();
         named.send_head(&HeaderMap::new(), &mut res).await;
 
@@ -1748,11 +1140,7 @@ mod tests {
         let path = temp_dir.path().join("hello.txt");
         std::fs::write(&path, b"hello").expect("write file");
 
-        let mut named = NamedFile::builder(&path)
-            .preload_threshold(0)
-            .build()
-            .await
-            .expect("build named file");
+        let mut named = build_preload_zero(&path, None).await;
         let computed = named.etag().expect("regular file has an etag");
         let reused = "\"cached-1\"".parse::<ETag>().expect("parse etag");
         named.set_etag(reused.clone());
@@ -1769,23 +1157,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_buffer_size_is_clamped() {
-        use std::io::Write as _;
-
-        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
-        file.write_all(b"hello").expect("write file");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .buffer_size(0)
-            .build()
-            .await
-            .expect("build named file");
-
-        assert_eq!(named.buffer_size, 1);
-    }
-
-    #[tokio::test]
     async fn etag_returns_none_for_pre_epoch_modified_time() {
         use std::io::Write as _;
         use std::time::Duration;
@@ -1794,10 +1165,7 @@ mod tests {
         file.write_all(b"hello").expect("write file");
         file.flush().expect("flush");
 
-        let mut named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
+        let mut named = build(file.path()).await;
         named.modified = Some(UNIX_EPOCH - Duration::from_secs(1));
 
         assert_eq!(named.etag(), None);
@@ -1815,13 +1183,10 @@ mod tests {
         file.write_all(b"hello").expect("write file");
         file.flush().expect("flush");
 
-        let mut named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
+        let mut named = build(file.path()).await;
         let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
         named.modified = Some(pre_epoch);
-        named.use_etag(false);
+        named.flags.remove(Flag::Etag);
         assert_eq!(named.last_modified(), Some(pre_epoch));
 
         let mut headers = HeaderMap::new();
@@ -1848,13 +1213,10 @@ mod tests {
         file.write_all(b"hello").expect("write file");
         file.flush().expect("flush");
 
-        let mut named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
+        let mut named = build(file.path()).await;
         named.modified =
             Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_nanos(500_000_000));
-        named.use_etag(false);
+        named.flags.remove(Flag::Etag);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1879,13 +1241,10 @@ mod tests {
         file.write_all(b"hello").expect("write file");
         file.flush().expect("flush");
 
-        let mut named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
+        let mut named = build(file.path()).await;
         named.modified =
             Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_nanos(500_000_000));
-        named.use_etag(false);
+        named.flags.remove(Flag::Etag);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1900,80 +1259,11 @@ mod tests {
 
     #[test]
     fn content_disposition_preserves_non_ascii_with_filename_star() {
-        let value = build_content_disposition(
-            "ignored.txt",
-            &mime::APPLICATION_OCTET_STREAM,
-            None,
-            Some("报告.csv"),
-        )
-        .unwrap();
+        let value = build_content_disposition("报告.csv", &mime::APPLICATION_OCTET_STREAM).unwrap();
 
         assert_eq!(
             value.to_str().unwrap(),
             "attachment; filename=\"__.csv\"; filename*=UTF-8''%E6%8A%A5%E5%91%8A.csv"
-        );
-    }
-
-    #[test]
-    fn only_self_coded_extensions_imply_an_encoding() {
-        assert_eq!(extension_content_encoding("svgz"), Some("gzip"));
-        // Matching follows `mime_infer`, which is case-insensitive.
-        assert_eq!(extension_content_encoding("SVGZ"), Some("gzip"));
-        assert_eq!(extension_content_encoding("x3dz"), Some("gzip"));
-        // A `.gz` or `.tgz` *is* the representation being served, not a coding
-        // applied to some other type, so it must keep its own content type and
-        // arrive undecoded.
-        assert_eq!(extension_content_encoding("gz"), None);
-        assert_eq!(extension_content_encoding("tgz"), None);
-        assert_eq!(extension_content_encoding("svg"), None);
-    }
-
-    #[tokio::test]
-    async fn svgz_is_typed_as_svg_and_encoded_as_gzip() {
-        use std::io::Write as _;
-
-        let mut file = tempfile::Builder::new()
-            .suffix(".svgz")
-            .tempfile()
-            .expect("create temp file");
-        file.write_all(&[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03])
-            .expect("write gzip header");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .build()
-            .await
-            .expect("build named file");
-
-        assert_eq!(*named.content_type(), mime::IMAGE_SVG);
-        assert_eq!(
-            named.content_encoding().map(|v| v.to_str().unwrap()),
-            Some("gzip")
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_content_encoding_wins_over_the_extension() {
-        use std::io::Write as _;
-
-        // A `.svgz` recompressed as a brotli sidecar must report what the caller
-        // configured, not the coding its extension would otherwise imply.
-        let mut file = tempfile::Builder::new()
-            .suffix(".svgz")
-            .tempfile()
-            .expect("create temp file");
-        file.write_all(b"not really brotli").expect("write");
-        file.flush().expect("flush");
-
-        let named = NamedFile::builder(file.path())
-            .content_encoding("br")
-            .build()
-            .await
-            .expect("build named file");
-
-        assert_eq!(
-            named.content_encoding().map(|v| v.to_str().unwrap()),
-            Some("br")
         );
     }
 }
