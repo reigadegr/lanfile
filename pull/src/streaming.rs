@@ -33,7 +33,6 @@ use crate::splice::{Moved, transfer};
 /// 头部分（类型 + 路径 + 长度）每条不到一百字节，一次 `read` 能覆盖几十条；正文超过
 /// 这个缓冲时剩余的走 `splice`，缓冲区里的那部分照常落盘。
 const STREAM_READ_BUF: usize = 64 * 1024;
-const MAX_RESPONSE_HEAD: usize = 16 * 1024;
 
 /// 一次流式拉取的统计。
 #[derive(Default)]
@@ -312,7 +311,7 @@ fn stream_file_content(
 /// `splice(2)`——缓冲区只服务头部分。
 struct BufferedSocket<'a> {
     socket: &'a TcpStream,
-    buf: Box<[u8]>,
+    buf: Vec<u8>,
     start: usize,
     end: usize,
 }
@@ -321,7 +320,7 @@ impl<'a> BufferedSocket<'a> {
     fn new(socket: &'a TcpStream) -> Self {
         Self {
             socket,
-            buf: vec![0_u8; STREAM_READ_BUF].into_boxed_slice(),
+            buf: vec![0_u8; STREAM_READ_BUF],
             start: 0,
             end: 0,
         }
@@ -337,13 +336,10 @@ impl<'a> BufferedSocket<'a> {
                 .position(|window| window == b"\r\n\r\n")
                 .map(|at| search_from + at + 4);
             if let Some(head_end) = found {
-                if head_end - self.start > MAX_RESPONSE_HEAD {
-                    return Err(Error::Malformed("响应头过长"));
-                }
                 break head_end;
             }
             if self.end == self.buf.len() {
-                return Err(Error::Malformed("响应头过长"));
+                self.buf.resize(self.buf.len() * 2, 0);
             }
             let read = self
                 .socket
@@ -354,9 +350,6 @@ impl<'a> BufferedSocket<'a> {
             }
             search_from = self.end.saturating_sub(3).max(search_from);
             self.end += read;
-            if self.end > MAX_RESPONSE_HEAD {
-                return Err(Error::Malformed("响应头过长"));
-            }
         };
         let head = &self.buf[self.start..head_end];
         let Some(line_end) = head.windows(2).position(|window| window == b"\r\n") else {

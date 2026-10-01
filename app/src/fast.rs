@@ -177,7 +177,6 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 const STREAM_BATCH_PREFIX: &str = "/stream-batch/";
 const MAX_STREAM_BATCH_BODY: usize = 64 * 1024 * 1024;
-const MAX_STREAM_BATCH_HEAD: usize = 16 * 1024;
 const STREAM_BATCH_READ_BUF: usize = 4096;
 const HEAD_END: &[u8; 4] = b"\r\n\r\n";
 
@@ -265,9 +264,6 @@ fn read_request_head(stream: &mut StdTcpStream) -> io::Result<(Vec<u8>, usize)> 
         head.extend_from_slice(&chunk[..read]);
         if let Some(end) = find_head_end(&head, search_start) {
             return Ok((head, end + 1));
-        }
-        if head.len() > MAX_STREAM_BATCH_HEAD {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "请求头过长"));
         }
     }
 }
