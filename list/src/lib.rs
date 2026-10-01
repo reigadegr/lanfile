@@ -1016,6 +1016,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     async fn zip_copy_throughput_by_buffer_size() {
         let path = std::env::temp_dir().join(format!("lanfile-perf-{}", std::process::id()));
         let mut f = File::create(&path).unwrap();
