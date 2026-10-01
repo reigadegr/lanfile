@@ -132,8 +132,8 @@ struct RawEntry {
     is_dir: bool,
     /// 文件长度，目录上的取值无意义
     size: u64,
-    /// 修改时间，`%Y-%m-%dT%H:%M:%S` 文本；取不到时为空串
-    modified: String,
+    /// 修改时间；`/api/list` 输出时才格式化
+    modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// 平台原语：把 `dir` 下每一条要展示的条目交给 `emit`。
@@ -191,10 +191,8 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
         if actual_ft.is_symlink() {
             continue;
         }
-        // 6. 直接读 st_mtime（跳过 SystemTime → Duration → as_secs 转换链）
-        let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0)
-            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
-            .unwrap_or_default();
+        // 6. 直接读 st_mtime；manifest 不需要展示时间，避免在遍历时格式化和分配
+        let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0);
         emit(RawEntry {
             // 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
             name: String::from_utf8_lossy(name_bytes).into_owned(),
@@ -229,9 +227,7 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
         let modified = metadata
             .modified()
             .ok()
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
-            .unwrap_or_default();
+            .map(chrono::DateTime::<chrono::Utc>::from);
         emit(RawEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: ft.is_dir(),
@@ -262,7 +258,10 @@ fn list_directory(root: &Path, path: &str) -> Option<Vec<ListEntry>> {
             name: entry.name,
             entry_type: if is_dir { "dir" } else { "file" },
             size,
-            modified: entry.modified,
+            modified: entry
+                .modified
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default(),
         });
     })?;
     sort_list_entries(&mut list_entries);
