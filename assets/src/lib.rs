@@ -9,7 +9,7 @@ use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
+use rustix::fs::{self as rfs, Advice, FileType, Mode, OFlags, ResolveFlags};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use salvo::http::header::CONTENT_DISPOSITION;
 use salvo::http::header::LAST_MODIFIED;
@@ -127,11 +127,8 @@ impl ServeFiles {
 
     /// 打开请求路径对应的文件。
     ///
-    /// 先取路径元数据判断类型；这一步同时用来校验缓存是否还有效。命中时直接给出
-    /// 缓存里的 fd、它的元数据以及解析好的响应头；未命中才打开文件。
-    /// 校验结果在 `REVALIDATE_MILLIS`（1 秒）内直接复用：这段时间里连上面那次
-    /// metadata 都不做，所以文件被改写、替换或删除后，最长 1 秒内仍按上一次校验过的
-    /// 元数据与 fd 响应。
+    /// 有效期外先打开文件并用 fd 元数据校验缓存；命中时直接给出缓存里的 fd、
+    /// 元数据以及解析好的响应头，未命中才沿用刚打开的文件。
     fn open(&self, sub: &str) -> Option<Opened> {
         // 有效期内的快路径：连 metadata 都省掉（本机 1.03 µs，占每请求 CPU 的 3%），
         // 连路径也不必再拼——缓存里存着上次拼好的那一份
@@ -145,9 +142,15 @@ impl ServeFiles {
             });
         }
         let joined = self.root.join(sub);
-        let metadata = self.regular_metadata(sub, &joined, true)?;
+        let opened = self.open_confirmed(sub, &joined);
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some(hit) = self.cache.get(sub, &metadata) {
+        if opened.is_none() {
+            self.cache.remove(sub);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some((_, metadata)) = &opened
+            && let Some(hit) = self.cache.get(sub, metadata)
+        {
             return Some(Opened {
                 path: hit.joined,
                 file: hit.file,
@@ -155,7 +158,8 @@ impl ServeFiles {
                 cached_headers: Some(hit.headers),
             });
         }
-        let (file, metadata) = self.open_confirmed(sub, &joined)?;
+        let (file, metadata) = opened?;
+        Self::advise_sequential(&file, &metadata);
         Some(Opened {
             path: Arc::from(joined),
             file,
@@ -171,43 +175,31 @@ impl ServeFiles {
     /// 整段跳过 [`FileCache`]。
     fn open_no_cache(&self, sub: &str) -> Option<(Arc<Path>, Arc<File>, FileMeta)> {
         let joined = self.root.join(sub);
-        self.regular_metadata(sub, &joined, false)?;
         let (file, metadata) = self.open_confirmed(sub, &joined)?;
+        Self::advise_sequential(&file, &metadata);
         Some((Arc::from(joined), file, metadata))
     }
 
-    fn regular_metadata(
-        &self,
-        sub: &str,
-        joined: &Path,
-        evict_stale: bool,
-    ) -> Option<std::fs::Metadata> {
-        let Ok(metadata) = std::fs::symlink_metadata(joined) else {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            if evict_stale {
-                self.cache.remove(sub);
-            }
-            return None;
-        };
-        metadata.is_file().then_some(metadata)
-    }
-
-    /// 已确认路径是普通文件之后：打开、取 fd 自己的元数据、下顺序读提示。
+    /// 打开文件并取 fd 自己的元数据，然后下顺序读提示。
     ///
     /// `/files` 未命中缓存时与 `/pull` 全程都走这里，两条路的这一段完全一致。
     fn open_confirmed(&self, sub: &str, joined: &Path) -> Option<(Arc<File>, FileMeta)> {
         let file = self.open_uncached(sub, joined)?;
         // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
         // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
-        let metadata = fd_meta(&file).ok()?;
-        // 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
-        // 提示作用在 fd 上，缓存命中的那个 fd 早就设过，所以缓存路径上只在未命中时调一次。
-        // 一页以内的文件整个读完也只有一页，预读窗口开多大结果都一样，这次系统调用可以省掉。
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if metadata.len() > 4096 {
-            let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
+        let (metadata, is_file) = fd_meta(&file).ok()?;
+        if !is_file {
+            return None;
         }
         Some((Arc::new(file), metadata))
+    }
+
+    /// 内核顺序读提示：扩大预读窗口，大文件连续传输更快；仅设置标志、立即返回。
+    fn advise_sequential(file: &File, metadata: &FileMeta) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if metadata.len() > 4096 {
+            let _ = rfs::fadvise(file, 0, None, Advice::Sequential);
+        }
     }
 
     #[cfg_attr(
@@ -225,7 +217,7 @@ impl ServeFiles {
     }
 }
 
-/// 取已打开 fd 的元数据。
+/// 取已打开 fd 的元数据，并确认它是普通文件。
 ///
 /// 不用 `std::fs::File::metadata()`：它在本目标上发的是 `statx(fd, AT_EMPTY_PATH)`
 /// （实测 353 ns），而 `fstat` 只要 285 ns，两者给出的 inode、长度与 mtime 完全相同。
@@ -234,21 +226,24 @@ impl ServeFiles {
 /// 字段转换宽度，所以显式关掉这两条 cast 检查。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
+fn fd_meta(file: &File) -> std::io::Result<(FileMeta, bool)> {
     let stat = rfs::fstat(file)?;
-    Ok(FileMeta::from_raw(
-        stat.st_size as u64,
-        stat.st_ino as u64,
-        stat.st_mtime as i64,
-        stat.st_mtime_nsec as i64,
+    Ok((
+        FileMeta::from_raw(
+            stat.st_size as u64,
+            stat.st_ino as u64,
+            stat.st_mtime as i64,
+            stat.st_mtime_nsec as i64,
+        ),
+        FileType::from_raw_mode(stat.st_mode).is_file(),
     ))
 }
 
 /// 其他平台没有直接发 `fstat` 的分支，退回 `std` 的元数据，字段值一致。
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
+fn fd_meta(file: &File) -> std::io::Result<(FileMeta, bool)> {
     file.metadata()
-        .map(|metadata| FileMeta::from_metadata(&metadata))
+        .map(|metadata| (FileMeta::from_metadata(&metadata), metadata.is_file()))
 }
 
 /// 一次 `openat2` 完成路径解析、越界检查与打开。

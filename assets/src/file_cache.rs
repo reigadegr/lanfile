@@ -28,9 +28,8 @@
 
 use std::path::Path;
 use std::{
-    fs::{File, Metadata},
+    fs::File,
     hash::{Hash, Hasher},
-    os::unix::fs::MetadataExt,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -185,9 +184,9 @@ impl FileCache {
 
     /// 命中时返回独立的 fd、它的元数据与已经编码好的响应头，调用方会把 fd 交给 `NamedFile` 消费掉。
     ///
-    /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中；命中即刷新有效期。
+    /// 只有 `ino`、大小与修改时间都与本次 fd 元数据一致才算命中；命中即刷新有效期。
     #[must_use]
-    pub fn get(&self, path: &str, metadata: &Metadata) -> Option<CacheHit> {
+    pub fn get(&self, path: &str, metadata: &FileMeta) -> Option<CacheHit> {
         self.lookup(path, |entry| {
             if entry.metadata.ino() != metadata.ino()
                 || entry.metadata.len() != metadata.len()
@@ -284,6 +283,7 @@ mod tests {
     use mime::Mime;
     use salvo::http::{HeaderValue, headers::ETag};
     use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt;
 
     fn text_plain() -> Arc<Mime> {
         Arc::new(match "text/plain; charset=utf-8".parse() {
@@ -329,12 +329,18 @@ mod tests {
         /// 打开文件并返回它的 fd 与 `fstat` 结果，模拟未命中时写入缓存的那份
         fn open(&self) -> std::io::Result<(File, FileMeta)> {
             let file = File::open(&self.path)?;
-            let metadata = crate::fd_meta(&file)?;
+            let (metadata, is_file) = crate::fd_meta(&file)?;
+            assert!(is_file);
             Ok((file, metadata))
         }
 
-        fn lstat(&self) -> std::io::Result<Metadata> {
+        fn lstat(&self) -> std::io::Result<std::fs::Metadata> {
             std::fs::symlink_metadata(&self.path)
+        }
+
+        fn meta(&self) -> std::io::Result<FileMeta> {
+            self.lstat()
+                .map(|metadata| FileMeta::from_metadata(&metadata))
         }
     }
 
@@ -365,7 +371,7 @@ mod tests {
             headers(),
         );
 
-        let cached = cache.get("file.txt", &fixture.lstat()?);
+        let cached = cache.get("file.txt", &fixture.meta()?);
         assert!(cached.is_some(), "元数据没变就应该命中");
 
         if let Some(CacheHit {
@@ -381,7 +387,7 @@ mod tests {
         }
 
         assert!(
-            cache.get("other.txt", &fixture.lstat()?).is_none(),
+            cache.get("other.txt", &fixture.meta()?).is_none(),
             "路径不同不该命中"
         );
         Ok(())
@@ -403,7 +409,7 @@ mod tests {
 
         std::fs::write(&fixture.path, b"hello, world")?;
         assert!(
-            cache.get("file.txt", &fixture.lstat()?).is_none(),
+            cache.get("file.txt", &fixture.meta()?).is_none(),
             "大小变了不该命中"
         );
         Ok(())
@@ -445,7 +451,7 @@ mod tests {
         )?;
 
         std::fs::rename(&replacement, &fixture.path)?;
-        let replaced = fixture.lstat()?;
+        let replaced = fixture.meta()?;
 
         assert_eq!(replaced.len(), 5, "替换文件的大小必须和原文件一样");
         assert!(
@@ -480,7 +486,7 @@ mod tests {
 
         let Some(CacheHit {
             headers: cached, ..
-        }) = cache.get("file.txt", &fixture.lstat()?)
+        }) = cache.get("file.txt", &fixture.meta()?)
         else {
             panic!("元数据没变就应该命中");
         };
@@ -509,7 +515,7 @@ mod tests {
         );
 
         cache.remove("file.txt");
-        assert!(cache.get("file.txt", &fixture.lstat()?).is_none());
+        assert!(cache.get("file.txt", &fixture.meta()?).is_none());
         Ok(())
     }
 
@@ -551,7 +557,7 @@ mod tests {
             "过了有效期就不该再走快路径"
         );
         assert!(
-            cache.get(path, &fixture.lstat()?).is_some(),
+            cache.get(path, &fixture.meta()?).is_some(),
             "元数据没变，逐次校验应当命中"
         );
         assert!(
@@ -590,7 +596,7 @@ mod tests {
             "条目总数不能超过上限"
         );
         assert!(
-            cache.get("path-1999", &fixture.lstat()?).is_some(),
+            cache.get("path-1999", &fixture.meta()?).is_some(),
             "最后插入的那条必须还在"
         );
         Ok(())
@@ -633,7 +639,7 @@ mod tests {
         }
 
         assert!(
-            cache.get(&target, &fixture.lstat()?).is_some(),
+            cache.get(&target, &fixture.meta()?).is_some(),
             "刚插入的应当命中"
         );
 
@@ -646,11 +652,11 @@ mod tests {
         );
 
         assert!(
-            cache.get(&target, &fixture.lstat()?).is_some(),
+            cache.get(&target, &fixture.meta()?).is_some(),
             "刚用过的不能被淘汰"
         );
         assert!(
-            cache.get(&paths[1], &fixture.lstat()?).is_none(),
+            cache.get(&paths[1], &fixture.meta()?).is_none(),
             "最久没被用到的应当被淘汰"
         );
         Ok(())
