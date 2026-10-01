@@ -33,8 +33,8 @@ use salvo::{
 mod body;
 mod stream;
 
-pub use body::{SendfileBody, SendfileSlot};
-pub use stream::{SendfileStream, SendfileTarget};
+pub use body::SendfileSlot;
+pub use stream::SendfileStream;
 
 /// Replaces a file response body with a zero-copy `sendfile(2)` body.
 ///
