@@ -127,8 +127,8 @@ impl ServeFiles {
 
     /// 打开请求路径对应的文件。
     ///
-    /// 有效期外先打开文件并用 fd 元数据校验缓存；命中时直接给出缓存里的 fd、
-    /// 元数据以及解析好的响应头，未命中才沿用刚打开的文件。
+    /// 有效期外先按路径校验已有缓存条目；命中时直接给出缓存里的 fd、元数据以及
+    /// 已经编码好的响应头，未命中或本来没有缓存才打开文件。
     fn open(&self, sub: &str) -> Option<Opened> {
         // 有效期内直接复用缓存条目，不打开文件。
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -141,21 +141,28 @@ impl ServeFiles {
             });
         }
         let joined = self.root.join(sub);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.cache.contains(sub) {
+            let metadata = std::fs::symlink_metadata(&joined)
+                .ok()
+                .filter(std::fs::Metadata::is_file);
+            let Some(metadata) = metadata else {
+                self.cache.remove(sub);
+                return None;
+            };
+            if let Some(hit) = self.cache.get(sub, &FileMeta::from_metadata(&metadata)) {
+                return Some(Opened {
+                    path: hit.joined,
+                    file: hit.file,
+                    metadata: hit.metadata,
+                    cached_headers: Some(hit.headers),
+                });
+            }
+        }
         let opened = self.open_confirmed(sub, &joined);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if opened.is_none() {
             self.cache.remove(sub);
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some((_, metadata)) = &opened
-            && let Some(hit) = self.cache.get(sub, metadata)
-        {
-            return Some(Opened {
-                path: hit.joined,
-                file: hit.file,
-                metadata: hit.metadata,
-                cached_headers: Some(hit.headers),
-            });
         }
         let (file, metadata) = opened?;
         Self::advise_sequential(&file, &metadata);

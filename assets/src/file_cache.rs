@@ -170,6 +170,13 @@ impl FileCache {
         })
     }
 
+    /// 是否存在指定条目；只用来决定复校验前有没有必要做一次路径 `lstat`。
+    #[must_use]
+    pub fn contains(&self, path: &str) -> bool {
+        let shard = lock(self.shard(path_hash(path)));
+        shard.entries.contains_key(path)
+    }
+
     /// 未命中时把刚打开并已 `fstat` 的文件放进缓存：缓存自己留一份 fd，调用方那份继续用。
     ///
     /// `metadata` 必须是这个 fd 自己的 `fstat` 结果（而不是路径的 `lstat`）：命中时它会被
