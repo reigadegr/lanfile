@@ -20,12 +20,13 @@ use std::{
     io::{self, IoSlice, Read as _, Write as _},
     net::TcpStream,
     path::Path,
+    time::Instant,
 };
 
 use crate::error::Error;
 use crate::fetch::{Via, encode_path};
 use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT, status_code};
-use crate::progress::SharedProgress;
+use crate::progress::{PROGRESS_INTERVAL_MS, SharedProgress};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::splice::{Moved, transfer_with_progress};
 
@@ -34,7 +35,6 @@ use crate::splice::{Moved, transfer_with_progress};
 /// 头部分（类型 + 路径 + 长度）每条不到一百字节，一次 `read` 能覆盖几十条；正文超过
 /// 这个缓冲时剩余的走 `splice`，缓冲区里的那部分照常落盘。
 const STREAM_READ_BUF: usize = 64 * 1024;
-
 /// 一次流式拉取的统计。
 #[derive(Default)]
 pub struct StreamStats {
@@ -88,7 +88,6 @@ pub async fn fetch_stream_shard(
     let host_owned = host.to_string();
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
-    let progress_owned = progress.clone();
     let request_body_len = entries.iter().map(|(path, _)| path.len() + 1).sum();
     let mut request_body = Vec::with_capacity(request_body_len);
     for (path, _) in &entries {
@@ -106,7 +105,7 @@ pub async fn fetch_stream_shard(
             &remote_owned,
             &target_owned,
             expected,
-            &progress_owned,
+            &progress,
         )
     })
     .await
@@ -206,7 +205,7 @@ fn fetch_stream_blocking(
                     &mut copy_buf,
                     progress,
                 ) {
-                    Ok((_, via)) => {
+                    Ok(via) => {
                         match via {
                             Via::Splice => outcome.stats.spliced += 1,
                             Via::Copy => outcome.stats.copied += 1,
@@ -214,7 +213,7 @@ fn fetch_stream_blocking(
                         }
                         outcome.stats.files += 1;
                         outcome.stats.bytes += size;
-                        progress.finish_stream_file();
+                        progress.finish_item(0);
                     }
                     Err(error) => {
                         drop(file);
@@ -285,8 +284,8 @@ fn write_all_vectored(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::R
 
 /// 把下一段 `size` 字节从 socket 搬进文件。
 ///
-/// 缓冲区里已有的正文先落盘（通常是上一次 `fill` 顺手读进来的），剩余的直接
-/// `splice(2)` 进文件，不再经过用户态。
+/// 缓冲区里已有的正文先落盘（通常是上一次 `fill` 顺手读进来的），剩余的优先走
+/// `splice(2)`，不可用时退回用户态读写。
 #[allow(clippy::too_many_arguments)]
 fn stream_file_content(
     mut socket: &TcpStream,
@@ -297,49 +296,48 @@ fn stream_file_content(
     reader: &mut BufferedSocket<'_>,
     copy_buf: &mut Vec<u8>,
     progress: &SharedProgress,
-) -> Result<(u64, Via), Error> {
-    let mut counted = 0_u64;
-    let mut count = |bytes: u64| {
-        counted += bytes;
-        progress.add_bytes(bytes);
-    };
+) -> Result<Via, Error> {
+    let mut chunks = ChunkProgress::new(progress);
 
     if size == 0 {
-        return Ok((0, Via::Prebuffered));
+        return Ok(Via::Prebuffered);
     }
 
     // 先把缓冲区里已有的那截正文落盘。缓冲区里可能只装了正文的一部分（大文件），
-    // 也可能装了全部（小文件）——`take` 取两者的最小值。
+    // 也可能装了全部（小文件），取两者的最小值。
     let from_buf = reader.available().min(size as usize);
     if from_buf > 0 {
         reader.consume_to(from_buf, file)?;
-        count(from_buf as u64);
     }
     let remaining = size - from_buf as u64;
     if remaining == 0 {
-        return Ok((counted, Via::Prebuffered));
+        chunks.flush();
+        return Ok(Via::Prebuffered);
     }
 
     // 剩下的正文不在缓冲区里，直接从 socket 搬。
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let moved = transfer_with_progress(socket, file, remaining, &mut count);
+    let mut on_progress = |bytes: u64| {
+        chunks.add(bytes);
+    };
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    match moved {
+    match transfer_with_progress(socket, file, remaining, &mut on_progress) {
         Err(error) => {
-            progress.subtract_bytes(counted);
+            chunks.rollback();
             return Err(error);
         }
         Ok(Moved::Unsupported) => {}
         Ok(Moved::Done(copied)) => {
             if copied == remaining {
-                return Ok((counted, Via::Splice));
+                chunks.flush();
+                return Ok(Via::Splice);
             }
             let error = Error::Truncated {
                 remote: format!("{remote}/{rel}"),
                 want: size,
                 got: size - remaining + copied,
             };
-            progress.subtract_bytes(counted);
+            chunks.rollback();
             return Err(error);
         }
     }
@@ -355,7 +353,7 @@ fn stream_file_content(
         let n = match socket.read(&mut buf[..want]) {
             Ok(n) => n,
             Err(error) => {
-                progress.subtract_bytes(counted);
+                chunks.rollback();
                 return Err(error.into());
             }
         };
@@ -365,14 +363,58 @@ fn stream_file_content(
                 want: size,
                 got: size - remaining,
             };
-            progress.subtract_bytes(counted);
+            chunks.rollback();
             return Err(error);
         }
-        file.write_all(&buf[..n])?;
-        count(n as u64);
+        if let Err(error) = file.write_all(&buf[..n]) {
+            chunks.rollback();
+            return Err(error.into());
+        }
+        chunks.add(n as u64);
         remaining -= n as u64;
     }
-    Ok((counted, Via::Copy))
+    chunks.flush();
+    Ok(Via::Copy)
+}
+
+struct ChunkProgress<'a> {
+    inner: &'a SharedProgress,
+    pending: u64,
+    submitted: u64,
+    last_flush: Instant,
+}
+
+impl<'a> ChunkProgress<'a> {
+    fn new(inner: &'a SharedProgress) -> Self {
+        Self {
+            inner,
+            pending: 0,
+            submitted: 0,
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn add(&mut self, bytes: u64) {
+        self.pending += bytes;
+        if self.last_flush.elapsed().as_millis() >= PROGRESS_INTERVAL_MS {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        let bytes = self.pending;
+        self.pending = 0;
+        if bytes == 0 {
+            return;
+        }
+        self.submitted += bytes;
+        self.last_flush = Instant::now();
+        self.inner.add_bytes(bytes);
+    }
+
+    fn rollback(&self) {
+        self.inner.subtract_bytes(self.submitted);
+    }
 }
 
 /// Discard a record whose size disagrees with the manifest, keeping the rest
@@ -558,7 +600,7 @@ mod tests {
             "sub",
             &target,
             vec![("a.txt".to_string(), 3), ("b.txt".to_string(), 3)],
-            SharedProgress::hidden(),
+            SharedProgress::new("拉取文件", "个文件", 0, 0),
         )
         .await
         .unwrap();
@@ -601,7 +643,7 @@ mod tests {
             "partial",
             &mut reader,
             &mut copy_buf,
-            &SharedProgress::hidden(),
+            &SharedProgress::new("拉取文件", "个文件", 0, 0),
         )
         .unwrap_err();
         assert!(matches!(

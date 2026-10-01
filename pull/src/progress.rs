@@ -6,7 +6,7 @@ use std::{
 };
 
 const BAR_WIDTH: usize = 24;
-const REDRAW_INTERVAL_MS: u128 = 100;
+pub const PROGRESS_INTERVAL_MS: u128 = 500;
 
 #[derive(Clone)]
 pub struct SharedProgress {
@@ -45,11 +45,6 @@ impl SharedProgress {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn hidden() -> Self {
-        Self::new("拉取文件", "个文件", 0, 0)
-    }
-
     pub(crate) fn complete_existing(&self, files: u64, bytes: u64) {
         if let Ok(mut progress) = self.inner.lock() {
             progress.done_files += files;
@@ -77,25 +72,10 @@ impl SharedProgress {
         }
     }
 
-    pub(crate) fn finish_file(&self, bytes: u64) {
+    pub(crate) fn finish_item(&self, bytes: u64) {
         if let Ok(mut progress) = self.inner.lock() {
             progress.done_files += 1;
             progress.done_bytes += bytes;
-            progress.done_bytes = progress.done_bytes.min(progress.total_bytes);
-            progress.draw(false);
-        }
-    }
-
-    pub(crate) fn finish_stream_file(&self) {
-        if let Ok(mut progress) = self.inner.lock() {
-            progress.done_files += 1;
-            progress.draw(false);
-        }
-    }
-
-    pub(crate) fn add_dir(&self) {
-        if let Ok(mut progress) = self.inner.lock() {
-            progress.done_files += 1;
             progress.draw(false);
         }
     }
@@ -115,7 +95,7 @@ impl Progress {
         if !self.enabled
             || (!force
                 && self.done_files < self.total_files
-                && self.last_draw.elapsed().as_millis() < REDRAW_INTERVAL_MS)
+                && self.last_draw.elapsed().as_millis() < PROGRESS_INTERVAL_MS)
         {
             return;
         }

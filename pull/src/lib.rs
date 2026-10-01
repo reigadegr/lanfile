@@ -248,7 +248,7 @@ async fn prepare_manifest(
         if entry.is_dir() {
             tokio::fs::create_dir_all(local.join(&entry.path)).await?;
             stats.dirs += 1;
-            progress.add_dir();
+            progress.finish_item(0);
         } else if let Some(size) = entry.size {
             if skip_existing(&local.join(&entry.path), Some(size)).await {
                 stats.skipped += 1;
@@ -273,14 +273,12 @@ async fn pull_stream_shards(
     mut files: HashMap<String, u64>,
     stats: &Stats,
 ) -> Result<(crate::streaming::StreamStats, Vec<String>), Error> {
-    let shards = build_shard_tasks(&mut files);
-    let total_files = shards.iter().flatten().count() as u64 + stats.skipped;
-    let total_bytes = shards
-        .iter()
-        .flatten()
-        .map(|(_, size)| size)
+    let total_files = files.len() as u64 + stats.skipped;
+    let total_bytes = files
+        .values()
         .sum::<u64>()
         .saturating_add(stats.skipped_bytes);
+    let shards = build_shard_tasks(&mut files);
     let progress = SharedProgress::new("拉取文件", "个文件", total_files, total_bytes);
     progress.complete_existing(stats.skipped, stats.skipped_bytes);
 
@@ -338,7 +336,7 @@ async fn retry_failed_files(
                 Ok(fetched) => {
                     stats.files += 1;
                     stats.bytes += fetched.bytes;
-                    progress.finish_file(fetched.bytes);
+                    progress.finish_item(fetched.bytes);
                     match fetched.via {
                         Via::Splice => stats.spliced += 1,
                         Via::Copy => stats.copied += 1,
@@ -553,7 +551,7 @@ mod tests {
             &local,
             vec!["bad.txt".to_string()],
             &mut stats,
-            &SharedProgress::hidden(),
+            &SharedProgress::new("拉取文件", "个文件", 0, 0),
         )
         .await;
 
