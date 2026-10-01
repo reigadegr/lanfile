@@ -156,7 +156,8 @@ impl ServeFiles {
     ///
     /// `lanfile get` 每个文件只请求一次，缓存不会有命中，却要为它加一次分片锁、分配一个 key，
     /// 分片满时还得扫一遍 LRU；下载出来的 fd 还会把 `/files` 缓存里的热文件挤出去。这条路上
-    /// 整段跳过 [`FileCache`]，只保留防穿越的路径解析与一次 `fstat`。
+    /// 整段跳过 [`FileCache`]：先 `lstat` 确认路径仍是普通文件，再用打开后 fd 的 `fstat`
+    /// 防止路径在两次检查之间被替换。
     fn open_no_cache(&self, sub: &str) -> Option<(Arc<Path>, Arc<File>, FileMeta)> {
         let joined = self.root.join(sub);
         self.regular_metadata(sub, &joined, false)?;
