@@ -10,7 +10,6 @@
 use crate::error::Error;
 use crate::http::{Pool, READ_TIMEOUT, http_get};
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt as _, BufReader};
@@ -20,11 +19,6 @@ use crate::splice::{Moved, transfer};
 
 /// 每块搬运的字节数：一次同步 `read` + 一次同步 `write` 处理这么多，够摊薄系统调用。
 const COPY_BUF: usize = 64 * 1024;
-
-thread_local! {
-    /// Reuses the fallback transfer buffer across files handled by one blocking worker.
-    static COPY_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
 
 /// 响应没带 `Content-Length` 时的报错：正文边界无从得知，当场说清，不猜长度。
 ///
@@ -262,36 +256,31 @@ fn copy_read_write(
     mut file: &std::fs::File,
     want: u64,
 ) -> Result<u64, Error> {
-    COPY_BUFFER.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        if buf.len() != COPY_BUF {
-            buf.resize(COPY_BUF, 0);
-        }
-        let mut total = 0_u64;
-        while total < want {
-            let room = (want - total).min(buf.len() as u64) as usize;
-            let read = match stream.read(&mut buf[..room]) {
-                Ok(0) => break,
-                Ok(n) => n,
-                // `set_read_timeout` 超时后 `read` 报 `WouldBlock`（Linux）或
-                // `TimedOut`（部分平台），两种都当作读超时。
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(Error::Timeout {
-                        phase: "读取正文"
-                    });
-                }
-                Err(error) => return Err(Error::Io(error)),
-            };
-            file.write_all(&buf[..read])?;
-            total += read as u64;
-        }
-        Ok(total)
-    })
+    let mut buf = vec![0_u8; COPY_BUF];
+    let mut total = 0_u64;
+    while total < want {
+        let room = (want - total).min(buf.len() as u64) as usize;
+        let read = match stream.read(&mut buf[..room]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // `set_read_timeout` 超时后 `read` 报 `WouldBlock`（Linux）或
+            // `TimedOut`（部分平台），两种都当作读超时。
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::Timeout {
+                    phase: "读取正文"
+                });
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        file.write_all(&buf[..read])?;
+        total += read as u64;
+    }
+    Ok(total)
 }
 
 /// 删掉没写完整的本地文件。删不掉也不覆盖真正的错误，只在 stderr 上留一句。
