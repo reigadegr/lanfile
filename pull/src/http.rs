@@ -153,12 +153,16 @@ async fn read_line_in_time(
 ///
 /// 值不是合法数字直接报错：拿不到可信长度就没法判断正文有没有被截断，与其悄悄放过，
 /// 不如当场把"对面发了个看不懂的长度"说出来。
+/// 重复的 `Content-Length` 同样报错：两个值即使相同，也说明对端响应头不可信。
 fn take_content_length(line: &str, content_length: &mut Option<u64>) -> Result<(), Error> {
     let Some((name, value)) = line.split_once(':') else {
         return Ok(());
     };
     if !name.trim().eq_ignore_ascii_case("content-length") {
         return Ok(());
+    }
+    if content_length.is_some() {
+        return Err(Error::Malformed("Content-Length 重复"));
     }
     *content_length = Some(
         value
@@ -205,6 +209,16 @@ mod tests {
             black_box(f());
         }
         start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
+    }
+
+    #[test]
+    fn duplicate_content_length_is_rejected() {
+        let mut content_length = Some(3_u64);
+
+        let error = take_content_length("Content-Length: 3", &mut content_length).unwrap_err();
+
+        assert!(error.to_string().contains("重复"));
+        assert_eq!(content_length, Some(3));
     }
 
     /// 基准：`memchr` 取状态码 vs `split_whitespace().nth(1)`，逐文件都会走一遍。
