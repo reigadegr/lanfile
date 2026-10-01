@@ -1,11 +1,9 @@
-//! 拉取操作：单文件下载 [`fetch_file`] 与目录列举 [`list_entries`]，都建在
+//! 单文件下载 [`fetch_file`] 与清单获取 [`fetch_manifest`]，都建在
 //! [`crate::http`] 的 keep-alive 传输之上。正文按响应声明的 `Content-Length` 精确读满即止，
 //! 读满的连接归还池子复用；读不满即截断，连接丢弃。落盘在 Linux/Android 且目标文件系统
 //! 支持时走 `splice(2)` 零拷贝（见 `crate::splice`），否则退回用户态读写的同步搬运。
 //!
-//! 连接池可被多个任务并发借还（[`crate::http::Pool`] 内部有锁），所以
-//! [`fetch_file`]/[`list_entries`] 只要 `&Pool`：调用方用 `buffer_unordered` 起并发，
-//! 每个文件各借一条连接，互不影响。
+//! 连接池可被多个调用共享（[`crate::http::Pool`] 内部有锁），所以入口只要 `&Pool`。
 
 use crate::error::Error;
 use crate::http::{Pool, READ_TIMEOUT, http_get};
@@ -27,30 +25,6 @@ const COPY_BUF: usize = 64 * 1024;
 /// 与 `/pull`（`NamedFile`）都带长度，所以正常走不到这一支。
 const NO_CONTENT_LENGTH: &str = "响应没有 Content-Length，无法确定正文边界";
 
-/// `/api/list` 返回的一条条目。
-///
-/// `type` 缺字段按文件处理（与原先 `unwrap_or("file")` 一致）；`size` 仅文件有，目录为
-/// `None`，用于"本地已存在且尺寸一致就跳过"。
-#[derive(Deserialize)]
-pub struct RemoteEntry {
-    pub name: String,
-    #[serde(rename = "type", default)]
-    pub kind: String,
-    pub size: Option<u64>,
-}
-
-impl RemoteEntry {
-    pub fn is_dir(&self) -> bool {
-        self.kind == "dir"
-    }
-}
-
-/// `/api/list` 的响应体：只取 `entries`，其余字段（`path`/`lan_ip`/`port`）客户端用不到。
-#[derive(Deserialize)]
-struct ListResponse {
-    entries: Vec<RemoteEntry>,
-}
-
 /// `/api/manifest` 返回的一条扁平条目，`path` 相对指定的远端目录。
 #[derive(Deserialize)]
 pub struct ManifestEntry {
@@ -69,17 +43,6 @@ impl ManifestEntry {
 #[derive(Deserialize)]
 struct ManifestResponse {
     entries: Vec<ManifestEntry>,
-}
-
-/// 取一层目录的条目：`GET /api/list[/<remote>]`。正文按 `Content-Length` 增量读满，连接干净
-/// 归还池子复用；读不满即截断，连接丢弃。
-pub async fn list_entries(
-    pool: &Pool,
-    host: &str,
-    remote: &str,
-) -> Result<Vec<RemoteEntry>, Error> {
-    let body = fetch_json_body(pool, host, remote, "/api/list", "读取目录列表").await?;
-    Ok(serde_json::from_slice::<ListResponse>(&body)?.entries)
 }
 
 /// 一次性取整棵远端目录的元数据清单。

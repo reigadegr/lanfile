@@ -30,9 +30,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// 可复用的 HTTP/1.1 keep-alive 连接池。
 ///
-/// 池里存空闲的连接：[`Pool::acquire`] 借一条、[`Pool::release`] 还一条。并发拉取时
-/// 每个任务各借一条，池空则新建；归还的连接被下一个 `acquire` 复用。同时在飞的连接数
-/// 由调用方用 `buffer_unordered(N)` 的 N 控制——池本身不做上限，`N` 就是这个上限。
+/// 池里存空闲的连接：[`Pool::acquire`] 借一条、[`Pool::release`] 还一条。并发调用时
+/// 每个任务各借一条，池空则新建；归还的连接被下一个 `acquire` 复用。池本身不做上限。
 #[derive(Default)]
 pub struct Pool {
     idle: Mutex<Vec<BufReader<TcpStream>>>,
@@ -68,7 +67,7 @@ impl Pool {
 }
 
 /// 借/建一条连接，写 `GET` 请求，读状态行并跳过响应头；返回可继续读正文的 reader 与响应
-/// 声明的 `Content-Length`，非 200 报错。`fetch_file`、`list_entries` 共有的请求前置收口于此。
+/// 声明的 `Content-Length`，非 200 报错。`fetch_file`、`fetch_manifest` 共有请求前置逻辑。
 ///
 /// 复用的连接若被服务端悄悄关掉（keep-alive 超时、对端 RST），下一次请求会在写或读状态行时
 /// 失败——这时换一条新连接重试一次，不让一个已死的池连接把整次拉取带走。只重试一次、且只在

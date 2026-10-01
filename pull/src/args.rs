@@ -28,7 +28,7 @@ pub struct Parsed {
 pub enum Kind {
     /// 裸 host + 名字：先试目录，404 再当文件。
     Auto,
-    /// `/api/zip/`、`/api/list/` 直链：当目录（逐个文件拉）。
+    /// `/api/zip/`、`/api/list/` 直链：当目录。
     Dir,
     /// `/files/`、`/pull/` 直链：直接当文件。
     File,
