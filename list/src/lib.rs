@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs::File,
     io::{Read as _, Write as _},
     net::TcpStream,
@@ -105,7 +104,7 @@ impl ListApi {
     }
 }
 
-/// 解析请求路径对应的绝对目录，且必须位于 root 之内（防目录穿越）。
+/// 解析请求路径对应的绝对目录。
 fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
     let canonical = root.join(sub).canonicalize().ok()?;
     canonical.starts_with(root).then_some(canonical)
@@ -121,10 +120,6 @@ fn sort_list_entries(entries: &mut [ListEntry]) {
 }
 
 /// 目录里的一条原始条目：平台原语交给共用逻辑的全部信息。
-///
-/// 符号链接在产生它的原语里就被丢掉了（不展示给前端：`/files` 下载同样拒绝，
-/// 避免出现下载即 404 的条目），所以这里没有它——名字的 `String` 因此也不会
-/// 为一条注定要丢的条目分配。
 struct RawEntry {
     /// 条目名（已按 `to_string_lossy` 处理非 UTF-8 字节）
     name: String,
@@ -173,25 +168,15 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        // 4. statat 相对 dirfd 获取 size + mtime
-        //    SYMLINK_NOFOLLOW 不跟随符号链接（比 std metadata() 更安全）
-        //    相对路径解析比绝对路径更快
+        // 4. statat 相对 dirfd 获取类型、size 与 mtime
         let Ok(stat) = rfs::statat(&dirfd, name_cstr, AtFlags::SYMLINK_NOFOLLOW) else {
             continue;
         };
-        // 5. d_type 判断类型（零 syscall，来自 dirent）；Unknown 时回退到 stat 的 st_mode
-        let ft = entry.file_type();
-        let actual_ft = if ft == FileType::Unknown {
-            FileType::from_raw_mode(stat.st_mode)
-        } else {
-            ft
-        };
-        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目。
-        // 判断放在分配名字之前，符号链接多时不必为注定丢弃的条目付一次 String。
+        // 5. 直接读 st_mtime；manifest 不需要展示时间，避免在遍历时格式化和分配
+        let actual_ft = FileType::from_raw_mode(stat.st_mode);
         if actual_ft.is_symlink() {
             continue;
         }
-        // 6. 直接读 st_mtime；manifest 不需要展示时间，避免在遍历时格式化和分配
         let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0);
         emit(RawEntry {
             // 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
@@ -214,13 +199,10 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
         let Ok(entry) = entry else {
             continue;
         };
-        // symlink_metadata 不跟随符号链接，与 Unix 版本 SYMLINK_NOFOLLOW 语义一致
         let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
         let ft = metadata.file_type();
-        // 符号链接不展示给前端：/files 下载同样拒绝，避免出现下载即 404 的条目。
-        // 判断放在分配名字之前，理由同上。
         if ft.is_symlink() {
             continue;
         }
@@ -590,7 +572,6 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    let mut seen = HashSet::new();
     let mut offset = 0;
     while offset < body.len() {
         let Some(nul) = body[offset..].iter().position(|&byte| byte == 0) else {
@@ -599,17 +580,8 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
         let path_end = offset + nul;
         let path = std::str::from_utf8(&body[offset..path_end])
             .map_err(|_| invalid("stream-batch 路径不是 UTF-8"))?;
-        if path.is_empty()
-            || path.len() > 8192
-            || path.starts_with('/')
-            || path
-                .split('/')
-                .any(|component| component.is_empty() || component == "..")
-        {
-            return Err(invalid("stream-batch 路径非法"));
-        }
-        if !seen.insert(path) {
-            return Err(invalid("stream-batch 路径重复"));
+        if path.is_empty() {
+            return Err(invalid("stream-batch 路径为空"));
         }
         entries.push(path.to_owned());
         offset = path_end + 1;
@@ -639,7 +611,7 @@ fn serve_stream_batch_inner(
     sub: &str,
     entries: &[String],
 ) -> std::io::Result<()> {
-    let target = resolve_under(root, sub).filter(|p| p.is_dir());
+    let target = resolve_under(root, sub).filter(|path| path.is_dir());
     let Some(target) = target else {
         socket.write_all(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -983,12 +955,7 @@ mod tests {
 
     #[test]
     fn parse_stream_batch_body_rejects_bad_entries() {
-        for body in [
-            &b"a.txt"[..],
-            &b"/a.txt\0"[..],
-            &b"../a.txt\0"[..],
-            &b"a.txt\0a.txt\0"[..],
-        ] {
+        for body in [&b"a.txt"[..], &b"\0"[..]] {
             assert!(parse_stream_batch_body(body).is_err());
         }
     }

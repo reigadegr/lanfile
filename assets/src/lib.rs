@@ -7,9 +7,7 @@ use lanfile_sendfile::{SendfileSlot, upgrade_response};
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::fd::OwnedFd;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
+use rustix::fs::{self as rfs, Advice};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use salvo::http::header::CONTENT_DISPOSITION;
 use salvo::http::header::LAST_MODIFIED;
@@ -56,15 +54,19 @@ struct CachedHeaders {
 
 pub struct ServeFiles {
     root: PathBuf,
-    /// root 的目录 fd：`openat2` 相对它解析路径，越界由内核直接拦下
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    root_fd: Option<Arc<OwnedFd>>,
-    /// 是否允许调用 `openat2`：装了 seccomp filter 的环境里它不在白名单，调用即被 SIGSYS 杀死
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    openat2_allowed: bool,
-    /// 已打开文件的缓存：命中时省掉 openat、4 次 readlink 与 fadvise
+    /// 已打开文件的缓存：命中时省掉 metadata、open 与 fadvise
     #[cfg(any(target_os = "linux", target_os = "android"))]
     cache: FileCache,
+}
+
+/// URL 解码后的路径可能包含 `..` 或绝对路径；这些路径先解析再确认仍在 root 内。
+fn under_root(root: &Path, sub: &str, joined: &Path) -> bool {
+    let needs_resolution =
+        sub.starts_with(['/', '\\']) || sub.split('/').any(|component| component == "..");
+    !needs_resolution
+        || joined
+            .canonicalize()
+            .is_ok_and(|canonical| canonical.starts_with(root))
 }
 
 /// [`ServeFiles::open`] 的返回值：拼好的路径、fd、元数据，以及命中时已经编码好的响应头。
@@ -111,37 +113,20 @@ impl ServeFiles {
     pub fn new(root: PathBuf) -> Self {
         Self {
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            root_fd: rfs::open(
-                &root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .ok()
-            .map(Arc::new),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            openat2_allowed: !seccomp_filter_installed(),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             cache: FileCache::default(),
             root,
         }
     }
 
-    /// 打开请求路径对应的文件，且必须位于 root 之内（防目录穿越）。
+    /// 打开请求路径对应的文件。
     ///
-    /// 先用 `symlink_metadata` 判断类型，符号链接不会被当作文件服务；这一步同时用来校验
-    /// 缓存是否还有效。命中时直接给出缓存里的 fd、它的元数据以及解析好的 `Content-Type`
-    /// 与已经编码好的 `ETag`、`Content-Disposition`（第四个元素为 `Some`）。未命中才真正去
-    /// 解析路径：让内核用一次 `openat2(RESOLVE_BENEATH)` 同时完成路径解析、越界检查与打开，
-    /// 省掉 `canonicalize` 对每一层路径各一次的 `readlink`。装了 seccomp filter 的环境
-    /// （Android）根本不调用 `openat2`（调用会被 SIGSYS 杀掉进程，见
-    /// [`seccomp_filter_installed`]），旧内核上它会返回错误，两种情况都回退到 canonicalize，
-    /// 因此对外行为与改动前一致。
-    ///
+    /// 先取路径元数据判断类型；这一步同时用来校验缓存是否还有效。命中时直接给出
+    /// 缓存里的 fd、它的元数据以及解析好的响应头；未命中才打开文件。
     /// 校验结果在 `REVALIDATE_MILLIS`（1 秒）内直接复用：这段时间里连上面那次
-    /// `symlink_metadata` 都不做，所以文件被改写、替换或删除后，最长 1 秒内仍按上一次校验过的
+    /// metadata 都不做，所以文件被改写、替换或删除后，最长 1 秒内仍按上一次校验过的
     /// 元数据与 fd 响应。
     fn open(&self, sub: &str) -> Option<Opened> {
-        // 有效期内的快路径：连 `symlink_metadata` 都省掉（本机 1.03 µs，占每请求 CPU 的 3%），
+        // 有效期内的快路径：连 metadata 都省掉（本机 1.03 µs，占每请求 CPU 的 3%），
         // 连路径也不必再拼——缓存里存着上次拼好的那一份
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(hit) = self.cache.get_fresh(sub) {
@@ -153,6 +138,9 @@ impl ServeFiles {
             });
         }
         let joined = self.root.join(sub);
+        if !under_root(&self.root, sub, &joined) {
+            return None;
+        }
         let metadata = self.regular_metadata(sub, &joined, true)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(hit) = self.cache.get(sub, &metadata) {
@@ -163,7 +151,7 @@ impl ServeFiles {
                 cached_headers: Some(hit.headers),
             });
         }
-        let (file, metadata) = self.open_confirmed(sub, &joined)?;
+        let (file, metadata) = Self::open_confirmed(&joined)?;
         Some(Opened {
             path: Arc::from(joined),
             file,
@@ -176,20 +164,17 @@ impl ServeFiles {
     ///
     /// `lanfile get` 每个文件只请求一次，缓存不会有命中，却要为它加一次分片锁、分配一个 key，
     /// 分片满时还得扫一遍 LRU；下载出来的 fd 还会把 `/files` 缓存里的热文件挤出去。这条路上
-    /// 整段跳过 [`FileCache`]：先 `lstat` 确认路径仍是普通文件，再用打开后 fd 的 `fstat`
-    /// 防止路径在两次检查之间被替换。
+    /// 整段跳过 [`FileCache`]。
     fn open_no_cache(&self, sub: &str) -> Option<(Arc<Path>, Arc<File>, FileMeta)> {
         let joined = self.root.join(sub);
+        if !under_root(&self.root, sub, &joined) {
+            return None;
+        }
         self.regular_metadata(sub, &joined, false)?;
-        let (file, metadata) = self.open_confirmed(sub, &joined)?;
+        let (file, metadata) = Self::open_confirmed(&joined)?;
         Some((Arc::from(joined), file, metadata))
     }
 
-    /// Returns path metadata after confirming that the path names a regular file.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android")),
-        allow(unused_variables)
-    )]
     fn regular_metadata(
         &self,
         sub: &str,
@@ -209,8 +194,8 @@ impl ServeFiles {
     /// 已确认路径是普通文件之后：打开、取 fd 自己的元数据、下顺序读提示。
     ///
     /// `/files` 未命中缓存时与 `/pull` 全程都走这里，两条路的这一段完全一致。
-    fn open_confirmed(&self, sub: &str, joined: &Path) -> Option<(Arc<File>, FileMeta)> {
-        let file = self.open_uncached(sub, joined)?;
+    fn open_confirmed(joined: &Path) -> Option<(Arc<File>, FileMeta)> {
+        let file = File::open(joined).ok()?;
         // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
         // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
         let metadata = fd_meta(&file).ok()?;
@@ -222,23 +207,6 @@ impl ServeFiles {
             let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
         }
         Some((Arc::new(file), metadata))
-    }
-
-    /// 缓存未命中时真正去解析并打开文件（类型检查已由 [`Self::open`] 完成）。
-    ///
-    /// `sub` 只有 Linux/Android 的 `openat2` 快路径读得到，其他平台上它确实没人用。
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android")),
-        allow(unused_variables)
-    )]
-    fn open_uncached(&self, sub: &str, joined: &Path) -> Option<File> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if self.openat2_allowed
-            && let Some(file) = self.root_fd.as_ref().and_then(|fd| open_beneath(fd, sub))
-        {
-            return Some(file);
-        }
-        open_via_canonicalize(&self.root, joined)
     }
 }
 
@@ -268,72 +236,6 @@ fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
         .map(|metadata| FileMeta::from_metadata(&metadata))
 }
 
-/// 一次 `openat2` 完成路径解析、越界检查与打开。
-///
-/// `RESOLVE_BENEATH` 要求解析结果不得越出 `root_fd`，`O_NOFOLLOW` 保证末级不是符号链接。
-/// 任何失败都返回 `None`，交给调用方回退到 canonicalize。
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_beneath(root_fd: &OwnedFd, sub: &str) -> Option<File> {
-    rfs::openat2(
-        root_fd,
-        sub,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
-    )
-    .ok()
-    .map(File::from)
-}
-
-/// `openat2` 不可用时的回退路径：先 canonicalize 再打开，与改动前的行为一致。
-fn open_via_canonicalize(root: &Path, joined: &Path) -> Option<File> {
-    let canonical = std::fs::canonicalize(joined).ok()?;
-    if !canonical.starts_with(root) {
-        return None;
-    }
-    File::open(canonical).ok()
-}
-
-/// 判断当前进程是否装了 seccomp filter（`SECCOMP_MODE_FILTER`）。
-///
-/// Android 的 `untrusted_app` 域由 zygote 装一个系统调用白名单 filter，不在白名单里的调用
-/// 会被 `SECCOMP_RET_TRAP` 处理：内核直接发 SIGSYS 杀掉进程，而不是返回错误码——手机上实测
-/// `openat2` 就是这样（`si_code=1` 即 `SYS_SECCOMP`，进程立即终止），"失败就回退"来不及生效。
-/// 读不到状态时按"装了"处理：猜错的代价是进程被杀。
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn seccomp_filter_installed() -> bool {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return true;
-    };
-    has_seccomp_filter(&status)
-}
-
-/// `/proc/self/status` 里 `Seccomp:` 为 2 即 `SECCOMP_MODE_FILTER`
-///
-/// 自己用 `memchr` 扫换行，不走 `lines()`：状态文件约 800 字节，这一遍扫描是整函数的主体，
-/// release 下 `memchr` 的 SIMD 比逐行迭代快约 1.3×（基准见 `bench_has_seccomp_filter`）。
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn has_seccomp_filter(status: &str) -> bool {
-    // 内核生成的状态文件全是 ASCII，`trim_ascii` 与 `trim` 在这里等价
-    let is_filter = |line: &[u8]| {
-        line.strip_prefix(b"Seccomp:")
-            .is_some_and(|value| value.trim_ascii() == b"2")
-    };
-    let mut rest = status.as_bytes();
-    loop {
-        match memchr::memchr(b'\n', rest) {
-            Some(at) => {
-                if is_filter(&rest[..at]) {
-                    return true;
-                }
-                rest = &rest[at + 1..];
-            }
-            // 末行没有换行符
-            None => return is_filter(rest),
-        }
-    }
-}
-
 impl ServeFiles {
     /// `/files` 的实际实现，`sub` 是已经解码好的子路径。
     ///
@@ -346,7 +248,7 @@ impl ServeFiles {
         res: &mut Response,
         slot: Option<&SendfileSlot>,
     ) {
-        // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
+        // 路径解析直接在 worker 上做：只有 metadata + open，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
         let Some(Opened {
@@ -506,7 +408,7 @@ pub fn static_routes() -> Router {
 mod tests {
     use super::*;
 
-    /// 临时 root：`root/ok.txt`、`root/sub/deep.txt`，以及 root 之外的一个文件用于穿越测试
+    /// 临时 root：`root/ok.txt`、`root/sub/deep.txt`
     struct Fixture {
         base: PathBuf,
         root: PathBuf,
@@ -520,10 +422,6 @@ mod tests {
             std::fs::create_dir_all(root.join("sub"))?;
             std::fs::write(root.join("ok.txt"), b"hello")?;
             std::fs::write(root.join("sub/deep.txt"), b"deep")?;
-            let outside = base.join("outside.txt");
-            std::fs::write(&outside, b"secret")?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&outside, root.join("outside-link.txt"))?;
             Ok(Self { base, root })
         }
     }
@@ -534,81 +432,15 @@ mod tests {
         }
     }
 
-    /// `openat2` 是快路径，结论必须和改动前的逻辑（lstat 判类型 + canonicalize 判越界）逐条一致
+    /// 普通文件能打开，目录与缺失路径不能当作文件服务
     #[test]
-    fn open_keeps_previous_behaviour() -> std::io::Result<()> {
-        let fixture = Fixture::new("parity")?;
+    fn open_handles_basic_paths() -> std::io::Result<()> {
+        let fixture = Fixture::new("basic")?;
         let files = ServeFiles::new(fixture.root.clone());
-        for sub in [
-            "ok.txt",
-            "sub/deep.txt",
-            "missing.txt",
-            "sub",
-            "outside-link.txt",
-            "../outside.txt",
-        ] {
-            let joined = fixture.root.join(sub);
-            let is_file = std::fs::symlink_metadata(&joined).is_ok_and(|meta| meta.is_file());
-            let expected = is_file && open_via_canonicalize(&fixture.root, &joined).is_some();
-            assert_eq!(
-                files.open(sub).is_some(),
-                expected,
-                "{sub} 的结论必须与改动前一致"
-            );
-        }
-        // 目录、符号链接、越界路径都必须拒绝
-        assert!(files.open("sub").is_none(), "目录不是文件");
-        assert!(files.open("outside-link.txt").is_none(), "符号链接不服务");
-        assert!(files.open("../outside.txt").is_none(), "不得穿越出 root");
-        // 回退路径本身必须可用：手机上 openat2 可能被 SELinux/seccomp 拦下
-        assert!(
-            open_via_canonicalize(&fixture.root, &fixture.root.join("ok.txt")).is_some(),
-            "回退路径必须能打开普通文件"
-        );
-        Ok(())
-    }
-
-    /// 手机上实测的 /proc/self/status 片段：`Seccomp:` 为 2 表示装了 filter，必须放弃 openat2
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn detects_seccomp_filter() {
-        assert!(has_seccomp_filter(
-            "Name:\tlanfile\nSeccomp:\t2\nSeccomp_filters:\t1\n"
-        ));
-        assert!(!has_seccomp_filter("Name:\tlanfile\nSeccomp:\t0\n"));
-        // 只有 `Seccomp:` 字段本身算数，`Seccomp_filters:` 不算
-        assert!(!has_seccomp_filter("Seccomp_filters:\t1\n"));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn openat2_handles_ordinary_paths() -> std::io::Result<()> {
-        let fixture = Fixture::new("fast")?;
-        let files = ServeFiles::new(fixture.root.clone());
-        // seccomp 环境里 openat2 不在白名单，硬调会被 SIGSYS 杀掉：这时快路径本就不会走，
-        // 直接跳过这些断言，回退路径的正确性由 open_keeps_previous_behaviour 覆盖
-        if !files.openat2_allowed {
-            return Ok(());
-        }
-        let Some(fd) = files.root_fd.as_ref() else {
-            panic!("root 目录 fd 应当打开成功");
-        };
-        assert!(
-            open_beneath(fd, "ok.txt").is_some(),
-            "快路径应当能打开普通文件"
-        );
-        assert!(
-            open_beneath(fd, "sub/deep.txt").is_some(),
-            "快路径应当能打开子目录里的文件"
-        );
-        assert!(
-            open_beneath(fd, "../outside.txt").is_none(),
-            "快路径必须拦下目录穿越"
-        );
-        assert!(
-            open_beneath(fd, "outside-link.txt").is_none(),
-            "O_NOFOLLOW 必须拦下符号链接"
-        );
+        assert!(files.open("ok.txt").is_some());
+        assert!(files.open("sub/deep.txt").is_some());
+        assert!(files.open("missing.txt").is_none());
+        assert!(files.open("sub").is_none());
         Ok(())
     }
 
@@ -672,54 +504,5 @@ mod tests {
                 );
                 Ok::<(), std::io::Error>(())
             })
-    }
-
-    /// 基准：`memchr` 扫换行 vs `lines()`，输入尺寸对齐真实的 `/proc/self/status`。
-    ///
-    /// `cargo test` 默认跑在 `opt-level = 0`：std 是预编译的优化产物而 `memchr` 不是，
-    /// 那种 profile 下这一项偏向 `lines()`；要看真实差距得加 `--release`。
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
-    fn bench_has_seccomp_filter() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        fn time(iters: u32, f: impl Fn() -> bool) -> f64 {
-            for _ in 0..iters / 10 {
-                black_box(f());
-            }
-            let start = Instant::now();
-            for _ in 0..iters {
-                black_box(f());
-            }
-            start.elapsed().as_secs_f64() * 1e9 / f64::from(iters)
-        }
-
-        // `Seccomp:` 放在中后段，整份尺寸与真实状态文件同量级
-        let mut status = "Name:\tlanfile\nState:\tS (sleeping)\n".repeat(10);
-        status.push_str("Seccomp:\t2\n");
-        status.push_str(&"Tgid:\t1234\n".repeat(40));
-
-        let old = |status: &str| {
-            status.lines().any(|line| {
-                line.strip_prefix("Seccomp:")
-                    .is_some_and(|value| value.trim() == "2")
-            })
-        };
-        assert!(old(&status), "原实现应当认出 filter");
-        assert!(has_seccomp_filter(&status), "memchr 版应当认出 filter");
-
-        let lines_ns = time(20_000, || old(&status));
-        let memchr_ns = time(20_000, || has_seccomp_filter(&status));
-        println!(
-            "基准 has_seccomp_filter（{}B）: lines() {lines_ns:.1} ns vs memchr {memchr_ns:.1} ns",
-            status.len()
-        );
-        // 只卡数量级：未优化的测试 profile 抖动大，这里不追求证明「更快」
-        assert!(
-            memchr_ns < lines_ns * 10.0,
-            "memchr 版比原实现慢了一个数量级: {memchr_ns:.1} vs {lines_ns:.1} ns"
-        );
     }
 }

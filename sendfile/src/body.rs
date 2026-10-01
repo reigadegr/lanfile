@@ -3,10 +3,7 @@
 use std::{
     fs::File,
     pin::Pin,
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, LazyLock, Mutex},
     task::{Context, Poll},
 };
 
@@ -51,7 +48,6 @@ pub struct Plan {
 /// consumes the plan once the response head has reached the socket.
 #[derive(Default)]
 pub struct SendfileSlot {
-    armed: AtomicBool,
     plan: Mutex<Option<Plan>>,
 }
 
@@ -81,7 +77,6 @@ impl SendfileSlot {
             remaining: len,
         });
         drop(plan);
-        self.armed.store(true, Ordering::Release);
         Some(SendfileBody {
             phantom: PHANTOM.clone(),
             remaining: len,
@@ -90,18 +85,16 @@ impl SendfileSlot {
 
     /// Whether a plan is waiting to be picked up by the transport stream.
     pub(crate) fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::Acquire)
+        self.plan.lock().is_ok_and(|plan| plan.is_some())
     }
 
-    /// Takes the armed plan, if any, and clears the armed flag.
+    /// Takes the armed plan, if any, and clears the slot.
     ///
     /// The flag is cleared even when there is no plan: once the stream has
     /// committed to reading placeholders it owns the plan, and leaving the slot
     /// armed would make the next response on the connection look like a file.
     pub(crate) fn take_plan(&self) -> Option<Plan> {
-        let plan = self.plan.lock().ok()?.take();
-        self.armed.store(false, Ordering::Release);
-        plan
+        self.plan.lock().ok()?.take()
     }
 }
 

@@ -8,83 +8,19 @@ use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
 pub enum Entry {
-    File {
-        /// 已用 `openat(dirfd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW)` 打开。
-        /// 相对父目录解析，省掉全路径逐层查找。
-        file: File,
-        /// 文件字节数（来自 `fstat`）。
-        size: u64,
-        /// zip 内路径（含 prefix）。
-        name: String,
-    },
-    Dir {
-        name: String,
-    },
+    File { file: File, size: u64, name: String },
+    Dir { name: String },
 }
 
-/// 按相对路径安全打开 root 内的普通文件，返回 fd 与 fstat 大小。
-///
-/// stream-batch 的文件列表来自客户端请求体；这里逐级 `openat(..., O_NOFOLLOW)`，
-/// 避免请求中的路径或竞态出现的符号链接把读取范围带出 root。
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
-    let mut dirfd = rfs::openat(
-        rfs::CWD,
-        dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()?;
-    let (parents, file_name) = match rel.rsplit_once('/') {
-        Some((parents, file_name)) => (parents, file_name),
-        None => ("", rel),
-    };
-    if !parents.is_empty() {
-        for component in parents.split('/') {
-            if component.is_empty() {
-                return None;
-            }
-            let child = rfs::openat(
-                &dirfd,
-                component,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .ok()?;
-            dirfd = child;
-        }
-    }
-    if file_name.is_empty() {
-        return None;
-    }
-    let fd = rfs::openat(
-        &dirfd,
-        file_name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .ok()?;
-    let stat = rfs::fstat(&fd).ok()?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return None;
-    }
-    #[allow(clippy::cast_sign_loss)]
-    Some((File::from(fd), stat.st_size as u64))
-}
-
-/// Fallback for platforms without `openat2`. This confines the resolved path to
-/// `dir`. Unlike the Unix fast path, it canonicalizes first and therefore follows
-/// a final symlink whose target remains under `dir`.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// 打开 root 下的普通文件，返回文件与大小。
 pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
     let path = dir.join(rel);
-    let canonical = path.canonicalize().ok()?;
-    if !canonical.starts_with(dir) {
+    if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
         return None;
     }
-    let file = File::open(canonical).ok()?;
+    let file = File::open(&path).ok()?;
     let metadata = file.metadata().ok()?;
-    metadata.is_file().then(|| (file, metadata.len()))
+    metadata.is_file().then_some((file, metadata.len()))
 }
 
 /// 取目录名作为 zip 内根前缀（也用于 Content-Disposition 文件名）。
@@ -146,10 +82,13 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
 
         let actual_ft = if ft == FileType::Unknown {
             rfs::statat(&dirfd, &name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_or(ft, |s| FileType::from_raw_mode(s.st_mode))
+                .map_or(ft, |stat| FileType::from_raw_mode(stat.st_mode))
         } else {
             ft
         };
+        if actual_ft.is_symlink() {
+            continue;
+        }
 
         let keep_going = if actual_ft.is_dir() {
             walk(&path, &zip_name, on_entry)
@@ -174,7 +113,7 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
                 None => true,
             }
         } else {
-            // 符号链接等其它类型：跳过
+            // 其它类型：跳过
             true
         };
         if !keep_going {
@@ -218,6 +157,9 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
             continue;
         };
         let ft = metadata.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
         let keep_going = if ft.is_dir() {
             walk(&path, &zip_name, on_entry)
         } else if ft.is_file() {

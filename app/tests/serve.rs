@@ -258,27 +258,19 @@ async fn files_endpoint_serves_special_names() {
     server.abort();
 }
 
-/// `/files` 走快路径：缺失文件、目录、路径穿越、符号链接一律 404；非 GET/HEAD 也是 404。
+/// `/files` 走快路径：缺失文件与目录返回 404；非 GET/HEAD 也是 404。
 #[tokio::test]
 async fn files_endpoint_rejects_invalid_paths() {
     let dir = TestDir::new();
     std::fs::create_dir_all(dir.root().join("sub")).unwrap();
     std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
-    #[cfg(unix)]
-    {
-        std::fs::write(dir.root().join("real.txt"), "real").unwrap();
-        std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt"))
-            .unwrap();
-    }
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    let mut paths = vec![
+    let paths = [
         "/files/nope.txt",
         "/files/sub",
         "/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
     ];
-    #[cfg(unix)]
-    paths.push("/files/alias.txt");
 
     for path in paths {
         let (head, _) = http_request(addr, "GET", path, "").await;

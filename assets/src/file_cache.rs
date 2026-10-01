@@ -102,17 +102,6 @@ pub struct FileCache {
 }
 
 /// 路径哈希：同一路径永远落在同一片，分片索引与 `HashMap` 查找共用同一份哈希。
-///
-/// 这里和片内的 `HashMap` 都用 `FxHash` 而不是 `SipHash`。理由不是「LAN 不怕 DoS」，而是
-/// 这套缓存的容量上界让碰撞 `DoS` 根本不成立：
-/// - 条目总数硬上限是 `SHARDS * CAPACITY_PER_SHARD`（每片 `CAPACITY_PER_SHARD` 条）。
-///   即使最坏情况整片同桶，也只是这几十个条目的线性扫描，没有 n² 退化。
-/// - 能进缓存的路径必须是 `root` 下真实存在的文件：`open` 里 `symlink_metadata` 失败会
-///   直接 `remove` 并返回，不会插入。要填满这张表，攻击者得先让这些文件真的存在。
-/// - 分片索引这一侧更无从攻击：落错片只降低命中率，不拉长任何一次查找。
-///
-/// 注意：若把 `FileCache` 挪去缓存**用户可控且不要求文件存在**的键，上面两条前提即不成立，
-/// 那时必须换回抗碰撞的哈希。
 fn path_hash(path: &str) -> u64 {
     let mut hasher = FxHasher::default();
     path.hash(&mut hasher);
