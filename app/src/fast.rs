@@ -176,7 +176,6 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
 /// accept 出错后的退避时间，取值与 salvo 的 `Server` 一致。
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 const STREAM_BATCH_PREFIX: &str = "/stream-batch/";
-const MAX_STREAM_BATCH_BODY: usize = 64 * 1024 * 1024;
 const STREAM_BATCH_READ_BUF: usize = 4096;
 const HEAD_END: &[u8; 4] = b"\r\n\r\n";
 
@@ -299,16 +298,11 @@ fn read_request_body(
         }
     }
     let length = length.unwrap_or(0);
-    if length > MAX_STREAM_BATCH_BODY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stream-batch 请求体过大",
-        ));
-    }
     let received = head.get(head_len..).unwrap_or_default();
     let take = received.len().min(length);
     let mut body = Vec::with_capacity(length);
     body.extend_from_slice(&received[..take]);
+    body.resize(length, 0);
     stream.read_exact(&mut body[take..])?;
     Ok(body)
 }
@@ -407,8 +401,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use std::borrow::Cow;
+    use std::io::Write as _;
+    use std::net::TcpListener;
 
-    use super::{Prefix, route_path, sub_path};
+    use super::{Prefix, read_request_body, read_request_head, route_path, sub_path};
 
     /// 快路径只认这两条前缀：`/pull` 必须由它自己服务，落到 salvo 就丢了零拷贝与不缓存的收益
     #[test]
@@ -491,6 +487,33 @@ mod tests {
             sub_path("/files/f.bin", Prefix::Files),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn request_body_beyond_read_buffer_is_completed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = vec![7_u8; 16 * 1024];
+        let expected = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (head, head_len) = read_request_head(&mut stream).unwrap();
+            read_request_body(&mut stream, &head, head_len).unwrap()
+        });
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /stream-batch/sub HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.write_all(&body).unwrap();
+        drop(client);
+
+        assert_eq!(server.join().unwrap(), expected);
     }
 
     /// 基准：前缀匹配各写法的耗时。

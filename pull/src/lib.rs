@@ -70,7 +70,7 @@ const STREAM_TASK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 ///
 /// 来源两种：
 /// - 裸 host（`http://h <remote> [local] [--flat]`）：`remote` 必给——拉根被禁，会在连服务端前
-///   直接报错；给了名字则先试目录，`/api/list` 返回 200 当目录拉，404 当单个文件拉。
+///   直接报错；给了名字先试目录清单，404 再当单个文件拉。
 /// - 直链（URL 的路径/fragment 已指明远端）：`http://h/files/<sub>`、`http://h/pull/<sub>` 当
 ///   文件；`http://h/api/zip/<sub>`、`http://h/api/list/<sub>` 当目录（逐个拉）；
 ///   `http://h/#<sub>` 走清单并发；
@@ -85,12 +85,12 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
     let pool = Pool::default();
     match p.kind {
         // 清单直链：一次取元数据，然后并发拉正文。
-        Kind::Stream => run_manifest(&pool, &p).await,
+        Kind::Stream => run_manifest(&pool, &p, false).await,
         // 直链已指明 kind：文件直接拉、目录当目录拉。
         Kind::File => run_file(&pool, &p).await,
         Kind::Dir => run_dir(&pool, &p, false).await,
-        // 裸 host：先试目录，`/api/list` 404 再当文件。
-        Kind::Auto => run_dir(&pool, &p, true).await,
+        // 裸 host：与清单直链同路；manifest 404 再当文件。
+        Kind::Auto => run_manifest(&pool, &p, true).await,
     }
 }
 
@@ -165,9 +165,15 @@ fn to_not_found(error: Error, remote: &str) -> Error {
 }
 
 /// 清单模式：一次取 manifest，目录先建好，文件按目录亲和分片并发拉。
-async fn run_manifest(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
+async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
     let target = local_target(&p.local, &p.remote, p.flat);
-    let entries = fetch_manifest(pool, &p.host, &p.remote).await?;
+    let entries = match fetch_manifest(pool, &p.host, &p.remote).await {
+        Ok(entries) => entries,
+        Err(Error::Http { status: 404, .. }) if fallback_file => {
+            return run_file(pool, p).await;
+        }
+        Err(error) => return Err(to_not_found(error, &p.remote).into()),
+    };
     let (mut stats, files) = prepare_manifest(&target, &entries).await?;
     let stream_stats = pull_stream_shards(&p.host, &p.remote, &target, files).await?;
     stats.files = stream_stats.files;
