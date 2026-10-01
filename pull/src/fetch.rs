@@ -168,19 +168,13 @@ pub async fn fetch_file(
     let (reader, declared) = http_get(pool, host, &path).await?;
     let want = declared.ok_or(Error::Malformed(NO_CONTENT_LENGTH))?;
 
-    // `BufReader::into_inner` 会丢弃内部缓冲里已预读的字节，而读响应头时它通常已经
-    // 预读了正文开头；先复制出来交给阻塞线程，避免丢掉正文的前几个字节。
-    let buffered = reader.buffer().to_vec();
-    let stream = reader.into_inner();
-
-    let (fetched, stream) =
-        match copy_in_blocking(stream, buffered, local.to_path_buf(), want).await {
-            Ok(landed) => landed,
-            Err(error) => {
-                discard(local).await;
-                return Err(error);
-            }
-        };
+    let (fetched, stream) = match copy_in_blocking(reader, local.to_path_buf(), want).await {
+        Ok(landed) => landed,
+        Err(error) => {
+            discard(local).await;
+            return Err(error);
+        }
+    };
 
     if fetched.bytes != want {
         discard(local).await;
@@ -204,54 +198,37 @@ pub async fn fetch_file(
 /// 占用。整个循环收进一个 blocking 线程后，一次文件传输只跨线程两次（进、出），其余
 /// 全是同步系统调用（`splice(2)` 或 `read`/`write`）。
 ///
-/// `buffered` 是 `BufReader` 预读出来、还没被消耗的正文开头；`into_inner` 会把它丢掉，
-/// 所以由调用方先取出来，这里负责先落盘再接着读。
+/// `BufReader` 预读出来的正文开头先在原有缓冲里落盘，再拆出 socket，避免复制一份缓冲。
 async fn copy_in_blocking(
-    stream: tokio::net::TcpStream,
-    buffered: Vec<u8>,
+    reader: BufReader<tokio::net::TcpStream>,
     target: PathBuf,
     want: u64,
 ) -> Result<(Fetched, std::net::TcpStream), Error> {
     tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::create(&target)?;
+        let buffered = reader.buffer().len().min(want as usize);
+        if buffered > 0 {
+            file.write_all(&reader.buffer()[..buffered])?;
+        }
+
         // `into_std` 只把 fd 转回 std，不改变阻塞模式；tokio 的 socket 是非阻塞的，
         // 要做同步读就得先切回阻塞。
-        let stream = stream.into_std()?;
+        let stream = reader.into_inner().into_std()?;
         stream.set_nonblocking(false)?;
-        let fetched = copy_sync(&stream, &buffered, &target, want)?;
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        let (copied, via) = copy_body(&stream, &file, want - buffered as u64)?;
         // 交还前切回非阻塞，否则 `from_std` 之后 reactor 会在错误的前提上注册 fd。
         stream.set_nonblocking(true)?;
-        Ok::<_, Error>((fetched, stream))
+        Ok::<_, Error>((
+            Fetched {
+                bytes: buffered as u64 + copied,
+                via,
+            },
+            stream,
+        ))
     })
     .await
     .map_err(|join| Error::Io(io::Error::other(join)))?
-}
-
-/// 同步地把正文搬进文件：读满 `want` 字节即停，或用完 socket 上的数据即停。
-///
-/// 读满是因为对端声明了 `Content-Length`，读多一个字节会把下一条响应的开头吃进缓冲；
-/// 读不满则由调用方按截断处理。每次读取都套一个 `READ_TIMEOUT` 的空闲超时（由
-/// `set_read_timeout` 挂在 socket 上），服务器接上却半路哑掉时不会把阻塞线程挂住。
-fn copy_sync(
-    stream: &std::net::TcpStream,
-    buffered: &[u8],
-    target: &Path,
-    want: u64,
-) -> Result<Fetched, Error> {
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    let mut file = std::fs::File::create(target)?;
-
-    // `BufReader` 预读出来的正文开头先落盘。对端若发多了（超过 `Content-Length`），
-    // 多出的字节已经在 `BufReader` 里被吞掉，这里截到 `want` 就不会误当正文写下去。
-    let take = buffered.len().min(want as usize);
-    if take > 0 {
-        file.write_all(&buffered[..take])?;
-    }
-
-    let (copied, via) = copy_body(stream, &file, want - take as u64)?;
-    Ok(Fetched {
-        bytes: take as u64 + copied,
-        via,
-    })
 }
 
 /// 把剩下的正文搬进文件（接着当前文件偏移写），返回落盘字节数与搬运方式。
