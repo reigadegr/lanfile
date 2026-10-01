@@ -126,18 +126,23 @@ const fn shard_index(hash: u64) -> usize {
 }
 
 /// 一次命中交出去的四样东西：拼好的路径、fd、元数据、已经编码好的响应头。
-type Hit = (Arc<Path>, Arc<File>, FileMeta, Arc<CachedHeaders>);
+pub struct CacheHit {
+    pub joined: Arc<Path>,
+    pub file: Arc<File>,
+    pub metadata: FileMeta,
+    pub headers: Arc<CachedHeaders>,
+}
 
 /// 从命中的条目里取出要交出去的东西，并刷新它的 LRU 序号
-fn take(entry: &mut Entry, clock: u64) -> Hit {
+fn take(entry: &mut Entry, clock: u64) -> CacheHit {
     entry.used = clock;
     // 锁里只做拷贝：克隆三个 `Arc` 加一份纯数据的元数据，没有系统调用，也没有堆分配
-    (
-        Arc::clone(&entry.joined),
-        Arc::clone(&entry.file),
-        entry.metadata.clone(),
-        Arc::clone(&entry.headers),
-    )
+    CacheHit {
+        joined: Arc::clone(&entry.joined),
+        file: Arc::clone(&entry.file),
+        metadata: entry.metadata.clone(),
+        headers: Arc::clone(&entry.headers),
+    }
 }
 
 impl FileCache {
@@ -153,7 +158,7 @@ impl FileCache {
     /// 闭包会被单态化并内联，因此两条调用路径（`get_fresh` / `get`）的机器码与原先
     /// 各自展开的实现一致。
     #[inline]
-    fn lookup<F>(&self, path: &str, check: F) -> Option<Hit>
+    fn lookup<F>(&self, path: &str, check: F) -> Option<CacheHit>
     where
         F: FnOnce(&mut Entry) -> bool,
     {
@@ -183,7 +188,7 @@ impl FileCache {
     /// 这里**不刷新**时间戳：否则持续被请求的热文件永远等不到复校验，陈旧窗口就成了无界。
     /// 复校验由 [`Self::get`] 做，它命中时会把时间戳刷新到当前时刻。
     #[must_use]
-    pub fn get_fresh(&self, path: &str) -> Option<Hit> {
+    pub fn get_fresh(&self, path: &str) -> Option<CacheHit> {
         self.lookup(path, |entry| {
             now_millis() - entry.validated_at < REVALIDATE_MILLIS
         })
@@ -193,7 +198,7 @@ impl FileCache {
     ///
     /// 只有 `ino`、大小与修改时间都与本次 `lstat` 的结果一致才算命中；命中即刷新有效期。
     #[must_use]
-    pub fn get(&self, path: &str, metadata: &Metadata) -> Option<Hit> {
+    pub fn get(&self, path: &str, metadata: &Metadata) -> Option<CacheHit> {
         self.lookup(path, |entry| {
             if entry.metadata.ino() != metadata.ino()
                 || entry.metadata.len() != metadata.len()
@@ -383,7 +388,13 @@ mod tests {
         let cached = cache.get("file.txt", &fixture.lstat()?);
         assert!(cached.is_some(), "元数据没变就应该命中");
 
-        if let Some((_, file, metadata, headers)) = cached {
+        if let Some(CacheHit {
+            file,
+            metadata,
+            headers,
+            ..
+        }) = cached
+        {
             assert_eq!(read_all(&file)?, "hello");
             assert_eq!(metadata.len(), 5, "命中时给出的元数据就是那个 fd 的");
             assert_eq!(headers.content_type, text_plain(), "命中时类型也从缓存来");
@@ -487,7 +498,10 @@ mod tests {
             }),
         );
 
-        let Some((_, _, _, cached)) = cache.get("file.txt", &fixture.lstat()?) else {
+        let Some(CacheHit {
+            headers: cached, ..
+        }) = cache.get("file.txt", &fixture.lstat()?)
+        else {
             panic!("元数据没变就应该命中");
         };
 

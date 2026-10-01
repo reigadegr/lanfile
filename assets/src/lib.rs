@@ -68,7 +68,12 @@ pub struct ServeFiles {
 }
 
 /// [`ServeFiles::open`] 的返回值：拼好的路径、fd、元数据，以及命中时已经编码好的响应头。
-type Opened = (Arc<Path>, Arc<File>, FileMeta, Option<Arc<CachedHeaders>>);
+struct Opened {
+    path: Arc<Path>,
+    file: Arc<File>,
+    metadata: FileMeta,
+    cached_headers: Option<Arc<CachedHeaders>>,
+}
 
 /// 从已经写完响应头的 `Response` 里取回编码好的 `Last-Modified`。
 ///
@@ -139,17 +144,32 @@ impl ServeFiles {
         // 有效期内的快路径：连 `symlink_metadata` 都省掉（本机 1.03 µs，占每请求 CPU 的 3%），
         // 连路径也不必再拼——缓存里存着上次拼好的那一份
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some((joined, file, metadata, headers)) = self.cache.get_fresh(sub) {
-            return Some((joined, file, metadata, Some(headers)));
+        if let Some(hit) = self.cache.get_fresh(sub) {
+            return Some(Opened {
+                path: hit.joined,
+                file: hit.file,
+                metadata: hit.metadata,
+                cached_headers: Some(hit.headers),
+            });
         }
         let joined = self.root.join(sub);
         let metadata = self.regular_metadata(sub, &joined, true)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Some((joined, file, metadata, headers)) = self.cache.get(sub, &metadata) {
-            return Some((joined, file, metadata, Some(headers)));
+        if let Some(hit) = self.cache.get(sub, &metadata) {
+            return Some(Opened {
+                path: hit.joined,
+                file: hit.file,
+                metadata: hit.metadata,
+                cached_headers: Some(hit.headers),
+            });
         }
         let (file, metadata) = self.open_confirmed(sub, &joined)?;
-        Some((Arc::from(joined), file, metadata, None))
+        Some(Opened {
+            path: Arc::from(joined),
+            file,
+            metadata,
+            cached_headers: None,
+        })
     }
 
     /// `/pull` 的打开：与 [`Self::open`] 同构，但不查缓存、不写缓存。
@@ -329,7 +349,13 @@ impl ServeFiles {
         // 路径解析直接在 worker 上做：只有 lstat + openat2，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
-        let Some((path, file, metadata, cached)) = self.open(sub) else {
+        let Some(Opened {
+            path,
+            file,
+            metadata,
+            cached_headers: cached,
+        }) = self.open(sub)
+        else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
@@ -596,7 +622,13 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(async {
-                let Some((joined, file, metadata, cached)) = files.open("ok.txt") else {
+                let Some(Opened {
+                    path: joined,
+                    file,
+                    metadata,
+                    cached_headers: cached,
+                }) = files.open("ok.txt")
+                else {
                     panic!("第一次应当打开成功");
                 };
                 assert!(cached.is_none(), "第一次不该命中");
@@ -621,7 +653,11 @@ mod tests {
                         disposition: Some(disposition.clone()),
                     }),
                 );
-                let Some((_, _, _, cached)) = files.open("ok.txt") else {
+                let Some(Opened {
+                    cached_headers: cached,
+                    ..
+                }) = files.open("ok.txt")
+                else {
                     panic!("第二次应当打开成功");
                 };
                 let Some(cached) = cached else {
