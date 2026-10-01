@@ -17,7 +17,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{self, Read as _, Write as _},
+    io::{self, IoSlice, Read as _, Write as _},
     net::TcpStream,
     path::Path,
 };
@@ -114,8 +114,7 @@ fn fetch_stream_blocking(
         "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         request_body.len()
     );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(request_body)?;
+    write_all_vectored(&mut stream, request.as_bytes(), request_body)?;
 
     let mut reader = BufferedSocket::new(&stream);
     let status = reader.read_response_head()?;
@@ -194,6 +193,28 @@ fn fetch_stream_blocking(
     }
     check_missing(&expected)?;
     Ok(stats)
+}
+
+/// Writes both request parts without copying them into one contiguous buffer.
+fn write_all_vectored(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::Result<()> {
+    let mut head_start = 0;
+    let mut body_start = 0;
+    while head_start < head.len() {
+        let written = stream.write_vectored(&[
+            IoSlice::new(&head[head_start..]),
+            IoSlice::new(&body[body_start..]),
+        ])?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        let head_written = written.min(head.len() - head_start);
+        head_start += head_written;
+        body_start += written - head_written;
+    }
+    if body_start < body.len() {
+        stream.write_all(&body[body_start..])?;
+    }
+    Ok(())
 }
 
 fn check_expected(expected: &mut HashMap<String, u64>, rel: &str, size: u64) -> Result<(), Error> {
