@@ -540,6 +540,13 @@ const SENDFILE_THRESHOLD: u64 = 64 * 1024;
 /// 覆盖网络侧正在写的一批记录，同时不会在深树上占住过多 fd。
 const STREAM_ENTRY_QUEUE: usize = 64;
 
+/// `/stream-batch` 发送线程拿到的一条已打开文件。
+struct StreamFile {
+    file: File,
+    size: u64,
+    name: String,
+}
+
 /// 从文件开头读满 `buf`，不改动文件偏移量（Unix 用 `pread`，非 Unix 复制 fd 后用 `seek`）。
 ///
 /// `/stream-batch` 的小文件走这里：`openat(dirfd, ...)` 拿到的 fd 是共享给 `sendfile` 的，
@@ -611,12 +618,12 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
     Ok(entries)
 }
 
-fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<zip::Entry>) {
+fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<StreamFile>) {
     for rel in entries {
         let Some((file, size)) = zip::open_file_under(target, rel) else {
             continue;
         };
-        let entry = zip::Entry::File {
+        let entry = StreamFile {
             file,
             size,
             name: rel.clone(),
@@ -651,7 +658,7 @@ fn serve_stream_batch_inner(
     let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
     let mut copy_buf = Vec::new();
 
-    let mut send_entry = |entry| {
+    let mut send_entry = |entry: StreamFile| {
         if error.is_some() {
             return false;
         }
@@ -663,36 +670,32 @@ fn serve_stream_batch_inner(
                 head_buf.clear();
             }
 
-            match entry {
-                zip::Entry::Dir { .. } => {}
-                zip::Entry::File { file, size, name } => {
-                    let rel = name.trim_start_matches('/');
-                    // 头部三个 write_all 合并进缓冲区一次写出
-                    head_buf.push(STREAM_FILE);
-                    head_buf.extend_from_slice(rel.as_bytes());
-                    head_buf.push(0);
-                    head_buf.extend_from_slice(&size.to_le_bytes());
+            let StreamFile { file, size, name } = entry;
+            let rel = name.trim_start_matches('/');
+            // 头部三个 write_all 合并进缓冲区一次写出
+            head_buf.push(STREAM_FILE);
+            head_buf.extend_from_slice(rel.as_bytes());
+            head_buf.push(0);
+            head_buf.extend_from_slice(&size.to_le_bytes());
 
-                    if size < SENDFILE_THRESHOLD {
-                        // 小文件：内容读进缓冲区，与头部一起发。
-                        // 先把 head_buf 扩到够长，再 `read_exact_at` 填进去。
-                        let start = head_buf.len();
-                        head_buf.resize(start + size as usize, 0);
-                        read_file_prefix(&file, &mut head_buf[start..])?;
-                        // 单个小文件可能把缓冲区顶满，顺手刷一次；不刷下一轮开头也会刷
-                        if head_buf.len() >= STREAM_BUF {
-                            socket.write_all(&head_buf)?;
-                            head_buf.clear();
-                        }
-                    } else {
-                        // 大文件：头部先出去，正文交给 sendfile。
-                        // 先刷头部能保证长度那 8 字节跟头部分一起落到
-                        // 对端缓冲，不会跟随后的 sendfile 抢一个 MSS 段。
-                        socket.write_all(&head_buf)?;
-                        head_buf.clear();
-                        sendfile_all(socket, &file, size, &mut copy_buf)?;
-                    }
+            if size < SENDFILE_THRESHOLD {
+                // 小文件：内容读进缓冲区，与头部一起发。
+                // 先把 head_buf 扩到够长，再 `read_exact_at` 填进去。
+                let start = head_buf.len();
+                head_buf.resize(start + size as usize, 0);
+                read_file_prefix(&file, &mut head_buf[start..])?;
+                // 单个小文件可能把缓冲区顶满，顺手刷一次；不刷下一轮开头也会刷
+                if head_buf.len() >= STREAM_BUF {
+                    socket.write_all(&head_buf)?;
+                    head_buf.clear();
                 }
+            } else {
+                // 大文件：头部先出去，正文交给 sendfile。
+                // 先刷头部能保证长度那 8 字节跟头部分一起落到
+                // 对端缓冲，不会跟随后的 sendfile 抢一个 MSS 段。
+                socket.write_all(&head_buf)?;
+                head_buf.clear();
+                sendfile_all(socket, &file, size, &mut copy_buf)?;
             }
             Ok(())
         })();
