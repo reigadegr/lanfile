@@ -92,16 +92,16 @@ async fn send_named_file(
     named_file: NamedFile,
     req: &Request,
     res: &mut Response,
-    slot: Option<&SendfileSlot>,
+    slot: &SendfileSlot,
     file: &Arc<File>,
 ) {
     let head_only = req.method() == Method::HEAD;
-    if head_only || (slot.is_some() && cfg!(any(target_os = "linux", target_os = "android"))) {
+    if head_only || cfg!(any(target_os = "linux", target_os = "android")) {
         named_file.send_head(req.headers(), res).await;
     } else {
         named_file.send(req.headers(), res).await;
     }
-    if !head_only && let Some(slot) = slot {
+    if !head_only {
         upgrade_response(slot, res, Arc::clone(file));
     }
 }
@@ -293,13 +293,7 @@ impl ServeFiles {
     ///
     /// salvo 的 handler 与 hyper 快路径共用这一个入口：两条路唯一的差别是错误页由谁补
     /// （salvo 侧是 catcher，快路径自己渲染），响应本身完全一致。找不到时只设状态码。
-    pub async fn serve(
-        &self,
-        sub: &str,
-        req: &Request,
-        res: &mut Response,
-        slot: Option<&SendfileSlot>,
-    ) {
+    pub async fn serve(&self, sub: &str, req: &Request, res: &mut Response, slot: &SendfileSlot) {
         // 路径解析直接在 worker 上做：只有 metadata + open，命中页缓存时是微秒级，
         // 而 spawn_blocking 的线程交接本身就要几十微秒，还得分摊 blocking pool 的全局锁。
         // 用阻塞线程池反而更慢：压测显示这一次 spawn_blocking 就占掉每请求约 7 次 futex 等待
@@ -390,7 +384,7 @@ impl ServeFiles {
         sub: &str,
         req: &Request,
         res: &mut Response,
-        slot: Option<&SendfileSlot>,
+        slot: &SendfileSlot,
     ) {
         let Some((path, file, metadata)) = self.open_no_cache(sub) else {
             res.status_code(StatusCode::NOT_FOUND);
@@ -413,26 +407,6 @@ impl ServeFiles {
         };
         // 与 `/files` 一致：HEAD 与 sendfile 都只写响应头，正文交给 upgrade_response 换成零拷贝体
         send_named_file(named_file, req, res, slot, &file).await;
-    }
-}
-
-#[handler]
-impl ServeFiles {
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        // 方法判断从路由过滤器挪到这里：salvo 的过滤器是 `#[async_trait]`，挂在路由上的
-        // 每个过滤器每请求都要装箱一个 future 并动态分发一次（实测 `Or<Method, Method>`
-        // 每请求两次分配），而在 handler 里只是一次比较。
-        // 语义不变：非 GET/HEAD 依旧是 404，空响应体交给 catcher 补错误页
-        if req.method() != Method::GET && req.method() != Method::HEAD {
-            res.status_code(StatusCode::NOT_FOUND);
-            return;
-        }
-
-        // 直接从路由参数里借一个 &str：`param::<String>` 会为每个请求分配一个 String，
-        // 再走一遍 serde 反序列化；通配参数就在这里，借出来就够了
-        let sub = req.params().get("path").map_or("", String::as_str);
-        self.serve(sub, req, res, None).await;
     }
 }
 

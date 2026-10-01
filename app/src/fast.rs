@@ -142,8 +142,8 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
                 // 求值放进这个分支里——非 GET/HEAD 只会返回 404，根本用不到子路径
                 let sub = sub_path(request.uri().path(), prefix);
                 match prefix {
-                    Prefix::Pull => files.serve_raw(&sub, &request, &mut res, Some(&slot)).await,
-                    Prefix::Files => files.serve(&sub, &request, &mut res, Some(&slot)).await,
+                    Prefix::Pull => files.serve_raw(&sub, &request, &mut res, &slot).await,
+                    Prefix::Files => files.serve(&sub, &request, &mut res, &slot).await,
                 }
             } else {
                 res.status_code(StatusCode::NOT_FOUND);

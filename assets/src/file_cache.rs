@@ -276,15 +276,6 @@ impl FileCache {
         drop(shard);
         drop(dropped);
     }
-
-    /// 总条目数，只有测试用得到
-    #[cfg(test)]
-    fn total_len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| lock(shard).entries.len())
-            .sum()
-    }
 }
 
 #[cfg(test)]
@@ -589,8 +580,13 @@ mod tests {
             );
         }
 
+        let total_len: usize = cache
+            .shards
+            .iter()
+            .map(|shard| lock(shard).entries.len())
+            .sum();
         assert!(
-            cache.total_len() <= SHARDS * CAPACITY_PER_SHARD,
+            total_len <= SHARDS * CAPACITY_PER_SHARD,
             "条目总数不能超过上限"
         );
         assert!(

@@ -51,23 +51,21 @@ pub use stream::SendfileStream;
 /// is expected to have disabled `NamedFile`'s small-file preload so that read is
 /// not paid before this is reached.
 ///
-/// The returned value reports whether the body was replaced.
-pub fn upgrade_response(slot: &SendfileSlot, res: &mut Response, file: Arc<File>) -> bool {
+pub fn upgrade_response(slot: &SendfileSlot, res: &mut Response, file: Arc<File>) {
     let status = res.status_code;
     if status != Some(StatusCode::OK) && status != Some(StatusCode::PARTIAL_CONTENT) {
-        return false;
+        return;
     }
     let Some(len) = header_u64(res, CONTENT_LENGTH) else {
-        return false;
+        return;
     };
     let offset = header_str(res, CONTENT_RANGE)
         .and_then(range_start)
         .unwrap_or(0);
     let Some(body) = slot.arm(file, offset, len) else {
-        return false;
+        return;
     };
     res.replace_body(ResBody::Boxed(Box::pin(body)));
-    true
 }
 
 /// 借出响应头里的字符串，不复制：调用方要么立刻解析成数字，要么马上解析成偏移量。
