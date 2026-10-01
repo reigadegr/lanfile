@@ -151,10 +151,7 @@ struct LogSink {
     pending: [Mutex<Vec<u8>>; SHARDS],
     /// 写线程睡着时用来叫醒它。
     ready: Condvar,
-    /// 写线程等 [`LOG_INTERVAL`] 时用的锁。它与各分片无关，这样写线程检查"全空"时不必先占住
-    /// 某一分片，也就不会与追加那一行的 worker 抢同一把锁。
-    gate: Mutex<()>,
-    /// 串行化"取出并写出"：同一时刻只有一个写出者，写出的顺序就是取出的顺序。
+    /// 串行化"取出并写出"，并作为写线程等待 [`LOG_INTERVAL`] 时的锁。
     writing: Mutex<()>,
 }
 
@@ -186,7 +183,6 @@ impl LogSink {
         Self {
             pending: [const { Mutex::new(Vec::new()) }; SHARDS],
             ready: Condvar::new(),
-            gate: Mutex::new(()),
             writing: Mutex::new(()),
         }
     }
@@ -246,11 +242,11 @@ impl LogSink {
                 // stdout 已经写不动了（管道对端消失之类），再试也没有意义
                 Err(_) => break,
             }
-            let gate = lock(&self.gate);
+            let writing = lock(&self.writing);
             // 锁在 `wait_timeout` 返回时已经释放；结果本身不重要，丢掉即可。
             // 叫醒与这里检查"全空"之间不是原子的，所以最坏也就是多等一个
             // `LOG_INTERVAL`，日志不会丢。
-            let _ = self.ready.wait_timeout(gate, LOG_INTERVAL);
+            let _ = self.ready.wait_timeout(writing, LOG_INTERVAL);
         }
     }
 }
