@@ -187,7 +187,7 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && i + 2 <= bytes.len()
+            && i + 2 < bytes.len()
             && let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
         {
             out.push(hi << 4 | lo);
@@ -385,5 +385,8 @@ mod tests {
         assert_eq!(percent_decode("boards.md%20"), "boards.md ");
         // 非法 %XX 原样保留
         assert_eq!(percent_decode("a%2z.txt"), "a%2z.txt");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%A"), "%A");
+        assert_eq!(percent_decode("a%"), "a%");
     }
 }
