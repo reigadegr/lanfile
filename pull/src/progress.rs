@@ -6,7 +6,7 @@ use std::{
 };
 
 const BAR_WIDTH: usize = 24;
-pub const PROGRESS_INTERVAL_MS: u128 = 500;
+pub const PROGRESS_INTERVAL_MS: u128 = 100;
 
 #[derive(Clone)]
 pub struct SharedProgress {

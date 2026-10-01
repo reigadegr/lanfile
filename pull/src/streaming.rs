@@ -213,7 +213,6 @@ fn fetch_stream_blocking(
                         }
                         outcome.stats.files += 1;
                         outcome.stats.bytes += size;
-                        progress.finish_item(0);
                     }
                     Err(error) => {
                         drop(file);
@@ -300,6 +299,7 @@ fn stream_file_content(
     let mut chunks = ChunkProgress::new(progress);
 
     if size == 0 {
+        chunks.finish();
         return Ok(Via::Prebuffered);
     }
 
@@ -311,7 +311,7 @@ fn stream_file_content(
     }
     let remaining = size - from_buf as u64;
     if remaining == 0 {
-        chunks.flush();
+        chunks.finish();
         return Ok(Via::Prebuffered);
     }
 
@@ -329,7 +329,7 @@ fn stream_file_content(
         Ok(Moved::Unsupported) => {}
         Ok(Moved::Done(copied)) => {
             if copied == remaining {
-                chunks.flush();
+                chunks.finish();
                 return Ok(Via::Splice);
             }
             let error = Error::Truncated {
@@ -373,10 +373,11 @@ fn stream_file_content(
         chunks.add(n as u64);
         remaining -= n as u64;
     }
-    chunks.flush();
+    chunks.finish();
     Ok(Via::Copy)
 }
 
+/// 暂存阻塞分片内的字节，按刷新间隔批量提交；失败时只回退已提交部分。
 struct ChunkProgress<'a> {
     inner: &'a SharedProgress,
     pending: u64,
@@ -410,6 +411,10 @@ impl<'a> ChunkProgress<'a> {
         self.submitted += bytes;
         self.last_flush = Instant::now();
         self.inner.add_bytes(bytes);
+    }
+
+    fn finish(self) {
+        self.inner.finish_item(self.pending);
     }
 
     fn rollback(&self) {
