@@ -104,7 +104,7 @@ impl ListApi {
     }
 }
 
-/// 解析请求路径对应的绝对目录。
+/// 解析请求路径对应的绝对目录，且必须位于 root 之内。
 fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
     let canonical = root.join(sub).canonicalize().ok()?;
     canonical.starts_with(root).then_some(canonical)
@@ -580,8 +580,14 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
         let path_end = offset + nul;
         let path = std::str::from_utf8(&body[offset..path_end])
             .map_err(|_| invalid("stream-batch 路径不是 UTF-8"))?;
-        if path.is_empty() {
-            return Err(invalid("stream-batch 路径为空"));
+        if path.is_empty()
+            || path.len() > 8192
+            || path.starts_with('/')
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || component == "..")
+        {
+            return Err(invalid("stream-batch 路径非法"));
         }
         entries.push(path.to_owned());
         offset = path_end + 1;
@@ -955,7 +961,13 @@ mod tests {
 
     #[test]
     fn parse_stream_batch_body_rejects_bad_entries() {
-        for body in [&b"a.txt"[..], &b"\0"[..]] {
+        for body in [
+            &b"a.txt"[..],
+            &b"\0"[..],
+            &b"/a.txt\0"[..],
+            &b"../a.txt\0"[..],
+            &b"a//b.txt\0"[..],
+        ] {
             assert!(parse_stream_batch_body(body).is_err());
         }
     }

@@ -12,15 +12,78 @@ pub enum Entry {
     Dir { name: String },
 }
 
-/// 打开 root 下的普通文件，返回文件与大小。
+/// 按相对路径安全打开 root 内的普通文件，返回 fd 与 fstat 大小。
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
-    let path = dir.join(rel);
-    if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+    if !is_confined_relative_path(rel) {
         return None;
     }
-    let file = File::open(&path).ok()?;
+    let mut dirfd = rfs::openat(
+        rfs::CWD,
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let (parents, file_name) = match rel.rsplit_once('/') {
+        Some((parents, file_name)) => (parents, file_name),
+        None => ("", rel),
+    };
+    if !parents.is_empty() {
+        for component in parents.split('/') {
+            if component.is_empty() {
+                return None;
+            }
+            let child = rfs::openat(
+                &dirfd,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .ok()?;
+            dirfd = child;
+        }
+    }
+    if file_name.is_empty() {
+        return None;
+    }
+    let fd = rfs::openat(
+        &dirfd,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .ok()?;
+    let stat = rfs::fstat(&fd).ok()?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Some((File::from(fd), stat.st_size as u64))
+}
+
+/// 非 Linux/Android 平台的回退实现。
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
+    if !is_confined_relative_path(rel) {
+        return None;
+    }
+    let path = dir.join(rel);
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(dir) {
+        return None;
+    }
+    let file = File::open(canonical).ok()?;
     let metadata = file.metadata().ok()?;
-    metadata.is_file().then_some((file, metadata.len()))
+    metadata.is_file().then(|| (file, metadata.len()))
+}
+
+fn is_confined_relative_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
 }
 
 /// 取目录名作为 zip 内根前缀（也用于 Content-Disposition 文件名）。
@@ -216,6 +279,19 @@ mod tests {
         for name in ["c", "d", "e"] {
             std::fs::write(root.join("dir").join(name), "x").unwrap();
         }
+    }
+
+    #[test]
+    fn open_file_under_rejects_escape_paths() {
+        let base = tmp_root("escape");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(base.join("outside.txt"), "secret").unwrap();
+
+        assert!(open_file_under(&root, "../outside.txt").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -7,7 +7,9 @@ use lanfile_sendfile::{SendfileSlot, upgrade_response};
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::fs::{self as rfs, Advice};
+use rustix::fd::OwnedFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix::fs::{self as rfs, Advice, Mode, OFlags, ResolveFlags};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use salvo::http::header::CONTENT_DISPOSITION;
 use salvo::http::header::LAST_MODIFIED;
@@ -54,19 +56,15 @@ struct CachedHeaders {
 
 pub struct ServeFiles {
     root: PathBuf,
+    /// root 的目录 fd：`openat2` 相对它解析路径，越界由内核直接拦下。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    root_fd: Option<OwnedFd>,
+    /// seccomp filter 可能直接杀死 `openat2` 调用者，因此必须先一次性探测。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    openat2_allowed: bool,
     /// 已打开文件的缓存：命中时省掉 metadata、open 与 fadvise
     #[cfg(any(target_os = "linux", target_os = "android"))]
     cache: FileCache,
-}
-
-/// URL 解码后的路径可能包含 `..` 或绝对路径；这些路径先解析再确认仍在 root 内。
-fn under_root(root: &Path, sub: &str, joined: &Path) -> bool {
-    let needs_resolution =
-        sub.starts_with(['/', '\\']) || sub.split('/').any(|component| component == "..");
-    !needs_resolution
-        || joined
-            .canonicalize()
-            .is_ok_and(|canonical| canonical.starts_with(root))
 }
 
 /// [`ServeFiles::open`] 的返回值：拼好的路径、fd、元数据，以及命中时已经编码好的响应头。
@@ -113,6 +111,15 @@ impl ServeFiles {
     pub fn new(root: PathBuf) -> Self {
         Self {
             #[cfg(any(target_os = "linux", target_os = "android"))]
+            root_fd: rfs::open(
+                &root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .ok(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            openat2_allowed: !seccomp_filter_installed(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             cache: FileCache::default(),
             root,
         }
@@ -138,9 +145,6 @@ impl ServeFiles {
             });
         }
         let joined = self.root.join(sub);
-        if !under_root(&self.root, sub, &joined) {
-            return None;
-        }
         let metadata = self.regular_metadata(sub, &joined, true)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(hit) = self.cache.get(sub, &metadata) {
@@ -151,7 +155,7 @@ impl ServeFiles {
                 cached_headers: Some(hit.headers),
             });
         }
-        let (file, metadata) = Self::open_confirmed(&joined)?;
+        let (file, metadata) = self.open_confirmed(sub, &joined)?;
         Some(Opened {
             path: Arc::from(joined),
             file,
@@ -167,11 +171,8 @@ impl ServeFiles {
     /// 整段跳过 [`FileCache`]。
     fn open_no_cache(&self, sub: &str) -> Option<(Arc<Path>, Arc<File>, FileMeta)> {
         let joined = self.root.join(sub);
-        if !under_root(&self.root, sub, &joined) {
-            return None;
-        }
         self.regular_metadata(sub, &joined, false)?;
-        let (file, metadata) = Self::open_confirmed(&joined)?;
+        let (file, metadata) = self.open_confirmed(sub, &joined)?;
         Some((Arc::from(joined), file, metadata))
     }
 
@@ -194,8 +195,8 @@ impl ServeFiles {
     /// 已确认路径是普通文件之后：打开、取 fd 自己的元数据、下顺序读提示。
     ///
     /// `/files` 未命中缓存时与 `/pull` 全程都走这里，两条路的这一段完全一致。
-    fn open_confirmed(joined: &Path) -> Option<(Arc<File>, FileMeta)> {
-        let file = File::open(joined).ok()?;
+    fn open_confirmed(&self, sub: &str, joined: &Path) -> Option<(Arc<File>, FileMeta)> {
+        let file = self.open_uncached(sub, joined)?;
         // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
         // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
         let metadata = fd_meta(&file).ok()?;
@@ -207,6 +208,20 @@ impl ServeFiles {
             let _ = rfs::fadvise(&file, 0, None, Advice::Sequential);
         }
         Some((Arc::new(file), metadata))
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        allow(unused_variables)
+    )]
+    fn open_uncached(&self, sub: &str, joined: &Path) -> Option<File> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.openat2_allowed
+            && let Some(file) = self.root_fd.as_ref().and_then(|fd| open_beneath(fd, sub))
+        {
+            return Some(file);
+        }
+        open_via_canonicalize(&self.root, joined)
     }
 }
 
@@ -234,6 +249,43 @@ fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
 fn fd_meta(file: &File) -> std::io::Result<FileMeta> {
     file.metadata()
         .map(|metadata| FileMeta::from_metadata(&metadata))
+}
+
+/// 一次 `openat2` 完成路径解析、越界检查与打开。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_beneath(root_fd: &OwnedFd, sub: &str) -> Option<File> {
+    rfs::openat2(
+        root_fd,
+        sub,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
+    )
+    .ok()
+    .map(File::from)
+}
+
+/// `openat2` 不可用时的回退路径。
+fn open_via_canonicalize(root: &Path, joined: &Path) -> Option<File> {
+    let canonical = std::fs::canonicalize(joined).ok()?;
+    if !canonical.starts_with(root) {
+        return None;
+    }
+    File::open(canonical).ok()
+}
+
+/// 判断当前进程是否装了 seccomp filter；读不到时按已安装处理。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn seccomp_filter_installed() -> bool {
+    std::fs::read_to_string("/proc/self/status").map_or(true, |status| has_seccomp_filter(&status))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn has_seccomp_filter(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("Seccomp:")
+            .is_some_and(|v| v.trim() == "2")
+    })
 }
 
 impl ServeFiles {
@@ -441,6 +493,25 @@ mod tests {
         assert!(files.open("sub/deep.txt").is_some());
         assert!(files.open("missing.txt").is_none());
         assert!(files.open("sub").is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_paths_leaving_root() -> std::io::Result<()> {
+        let fixture = Fixture::new("escapes")?;
+        std::fs::write(fixture.base.join("outside.txt"), b"secret")?;
+        std::fs::create_dir_all(fixture.base.join("outside-dir"))?;
+        std::fs::write(fixture.base.join("outside-dir/secret.txt"), b"secret")?;
+        std::os::unix::fs::symlink(fixture.base.join("outside-dir"), fixture.root.join("link"))?;
+        std::os::unix::fs::symlink(
+            fixture.base.join("outside.txt"),
+            fixture.root.join("outside-link.txt"),
+        )?;
+        let files = ServeFiles::new(fixture.root.clone());
+        assert!(files.open("../outside.txt").is_none());
+        assert!(files.open("outside-link.txt").is_none());
+        assert!(files.open("link/secret.txt").is_none());
         Ok(())
     }
 

@@ -88,11 +88,7 @@ impl SendfileSlot {
         self.plan.lock().is_ok_and(|plan| plan.is_some())
     }
 
-    /// Takes the armed plan, if any, and clears the slot.
-    ///
-    /// The flag is cleared even when there is no plan: once the stream has
-    /// committed to reading placeholders it owns the plan, and leaving the slot
-    /// armed would make the next response on the connection look like a file.
+    /// Takes the plan, if any, and clears the slot.
     pub(crate) fn take_plan(&self) -> Option<Plan> {
         self.plan.lock().ok()?.take()
     }
