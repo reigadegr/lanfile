@@ -4,6 +4,8 @@ use std::{fmt::Write as _, fs::File, path::Path};
 use std::mem::MaybeUninit;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+use rustix::fd::OwnedFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
@@ -12,48 +14,25 @@ pub enum Entry {
     Dir { name: String },
 }
 
-/// 按相对路径安全打开 root 内的普通文件，返回 fd 与 fstat 大小。
+/// 打开批量发送的目标目录，供后续文件相对它解析。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
-    if !is_confined_relative_path(rel) {
-        return None;
-    }
-    let mut dirfd = rfs::openat(
+pub fn open_dir(dir: &Path) -> Option<OwnedFd> {
+    rfs::openat(
         rfs::CWD,
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .ok()?;
-    let (parents, file_name) = match rel.rsplit_once('/') {
-        Some((parents, file_name)) => (parents, file_name),
-        None => ("", rel),
-    };
-    if !parents.is_empty() {
-        for component in parents.split('/') {
-            if component.is_empty() {
-                return None;
-            }
-            let child = rfs::openat(
-                &dirfd,
-                component,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .ok()?;
-            dirfd = child;
-        }
-    }
-    if file_name.is_empty() {
+    .ok()
+}
+
+/// 相对目标目录打开普通文件，并用 fd 自己的 fstat 大小。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn open_file_under(dirfd: &OwnedFd, rel: &str) -> Option<(File, u64)> {
+    if !is_confined_relative_path(rel) {
         return None;
     }
-    let fd = rfs::openat(
-        &dirfd,
-        file_name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .ok()?;
+    let fd = rfs::openat(dirfd, rel, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).ok()?;
     let stat = rfs::fstat(&fd).ok()?;
     if !FileType::from_raw_mode(stat.st_mode).is_file() {
         return None;
@@ -289,7 +268,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(base.join("outside.txt"), "secret").unwrap();
 
-        assert!(open_file_under(&root, "../outside.txt").is_none());
+        let dirfd = open_dir(&root).unwrap();
+        assert!(open_file_under(&dirfd, "../outside.txt").is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }

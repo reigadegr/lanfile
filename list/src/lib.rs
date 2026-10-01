@@ -596,8 +596,11 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
 }
 
 fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<StreamFile>) {
+    let Some(dirfd) = zip::open_dir(target) else {
+        return;
+    };
     for rel in entries {
-        let Some((file, size)) = zip::open_file_under(target, rel) else {
+        let Some((file, size)) = zip::open_file_under(&dirfd, rel) else {
             continue;
         };
         let entry = StreamFile {
