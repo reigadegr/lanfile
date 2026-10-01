@@ -42,13 +42,29 @@ thread_local! {
 ///
 /// 返回 [`Moved::Unsupported`] 时 socket 上一个字节都没被读走，调用方可以原样改用用户态读写。
 pub fn transfer(stream: &TcpStream, file: &File, want: u64) -> Result<Moved, Error> {
+    transfer_with_progress(stream, file, want, |_| {})
+}
+
+pub fn transfer_with_progress(
+    stream: &TcpStream,
+    file: &File,
+    want: u64,
+    mut on_progress: impl FnMut(u64),
+) -> Result<Moved, Error> {
     PIPE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let (pipe_read, pipe_write) = match slot.take() {
             Some(pipe) => pipe,
             None => pipe_with(PipeFlags::CLOEXEC).map_err(io::Error::from)?,
         };
-        match transfer_inner(stream, &pipe_read, &pipe_write, file, want) {
+        match transfer_inner(
+            stream,
+            &pipe_read,
+            &pipe_write,
+            file,
+            want,
+            &mut on_progress,
+        ) {
             Ok(moved) => {
                 // `Done` 已把所有字节从管道里 drain 走，`Unsupported` 一个字节都没写，
                 // 两种情况管道里都是空的，可以安全复用。
@@ -68,6 +84,7 @@ fn transfer_inner(
     pipe_write: &OwnedFd,
     file: &File,
     want: u64,
+    on_progress: &mut dyn FnMut(u64),
 ) -> Result<Moved, Error> {
     if !supported(pipe_read, file) {
         return Ok(Moved::Unsupported);
@@ -91,6 +108,7 @@ fn transfer_inner(
         };
         total += read as u64;
         drain(pipe_read, file, read)?;
+        on_progress(read as u64);
     }
     Ok(Moved::Done(total))
 }

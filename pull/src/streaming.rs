@@ -25,8 +25,9 @@ use std::{
 use crate::error::Error;
 use crate::fetch::{Via, encode_path};
 use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT, status_code};
+use crate::progress::SharedProgress;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use crate::splice::{Moved, transfer};
+use crate::splice::{Moved, transfer_with_progress};
 
 /// 流式响应头部分的读取缓冲大小。
 ///
@@ -73,6 +74,7 @@ pub async fn fetch_stream_shard(
     remote: &str,
     target: &Path,
     entries: Vec<(String, u64)>,
+    progress: SharedProgress,
 ) -> Result<StreamOutcome, Error> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(host))
         .await
@@ -86,6 +88,7 @@ pub async fn fetch_stream_shard(
     let host_owned = host.to_string();
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
+    let progress_owned = progress.clone();
     let request_body_len = entries.iter().map(|(path, _)| path.len() + 1).sum();
     let mut request_body = Vec::with_capacity(request_body_len);
     for (path, _) in &entries {
@@ -103,6 +106,7 @@ pub async fn fetch_stream_shard(
             &remote_owned,
             &target_owned,
             expected,
+            &progress_owned,
         )
     })
     .await
@@ -110,6 +114,7 @@ pub async fn fetch_stream_shard(
 }
 
 /// 阻塞线程内完成「发请求 → 读响应头 → 逐条解码 → 落盘」全流程。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn fetch_stream_blocking(
     mut stream: TcpStream,
     host: &str,
@@ -118,6 +123,7 @@ fn fetch_stream_blocking(
     remote: &str,
     target: &Path,
     mut expected: HashMap<String, u64>,
+    progress: &SharedProgress,
 ) -> Result<StreamOutcome, Error> {
     // tokio 的 socket 是非阻塞的，切回阻塞模式才能用同步 IO
     stream.set_nonblocking(false)?;
@@ -198,8 +204,9 @@ fn fetch_stream_blocking(
                     rel,
                     &mut reader,
                     &mut copy_buf,
+                    progress,
                 ) {
-                    Ok(via) => {
+                    Ok((_, via)) => {
                         match via {
                             Via::Splice => outcome.stats.spliced += 1,
                             Via::Copy => outcome.stats.copied += 1,
@@ -207,6 +214,7 @@ fn fetch_stream_blocking(
                         }
                         outcome.stats.files += 1;
                         outcome.stats.bytes += size;
+                        progress.finish_stream_file();
                     }
                     Err(error) => {
                         drop(file);
@@ -279,6 +287,7 @@ fn write_all_vectored(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::R
 ///
 /// 缓冲区里已有的正文先落盘（通常是上一次 `fill` 顺手读进来的），剩余的直接
 /// `splice(2)` 进文件，不再经过用户态。
+#[allow(clippy::too_many_arguments)]
 fn stream_file_content(
     mut socket: &TcpStream,
     mut file: &File,
@@ -287,9 +296,16 @@ fn stream_file_content(
     rel: &str,
     reader: &mut BufferedSocket<'_>,
     copy_buf: &mut Vec<u8>,
-) -> Result<Via, Error> {
+    progress: &SharedProgress,
+) -> Result<(u64, Via), Error> {
+    let mut counted = 0_u64;
+    let mut count = |bytes: u64| {
+        counted += bytes;
+        progress.add_bytes(bytes);
+    };
+
     if size == 0 {
-        return Ok(Via::Prebuffered);
+        return Ok((0, Via::Prebuffered));
     }
 
     // 先把缓冲区里已有的那截正文落盘。缓冲区里可能只装了正文的一部分（大文件），
@@ -297,23 +313,35 @@ fn stream_file_content(
     let from_buf = reader.available().min(size as usize);
     if from_buf > 0 {
         reader.consume_to(from_buf, file)?;
+        count(from_buf as u64);
     }
     let remaining = size - from_buf as u64;
     if remaining == 0 {
-        return Ok(Via::Prebuffered);
+        return Ok((counted, Via::Prebuffered));
     }
 
     // 剩下的正文不在缓冲区里，直接从 socket 搬。
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Moved::Done(copied) = transfer(socket, file, remaining)? {
-        if copied == remaining {
-            return Ok(Via::Splice);
+    let moved = transfer_with_progress(socket, file, remaining, &mut count);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    match moved {
+        Err(error) => {
+            progress.subtract_bytes(counted);
+            return Err(error);
         }
-        return Err(Error::Truncated {
-            remote: format!("{remote}/{rel}"),
-            want: size,
-            got: size - remaining + copied,
-        });
+        Ok(Moved::Unsupported) => {}
+        Ok(Moved::Done(copied)) => {
+            if copied == remaining {
+                return Ok((counted, Via::Splice));
+            }
+            let error = Error::Truncated {
+                remote: format!("{remote}/{rel}"),
+                want: size,
+                got: size - remaining + copied,
+            };
+            progress.subtract_bytes(counted);
+            return Err(error);
+        }
     }
 
     // 非 Linux/Android，或目标文件系统不支持 splice_write：用户态读写兜底
@@ -324,18 +352,27 @@ fn stream_file_content(
     let buf = &mut copy_buf[..];
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
-        let n = socket.read(&mut buf[..want])?;
+        let n = match socket.read(&mut buf[..want]) {
+            Ok(n) => n,
+            Err(error) => {
+                progress.subtract_bytes(counted);
+                return Err(error.into());
+            }
+        };
         if n == 0 {
-            return Err(Error::Truncated {
+            let error = Error::Truncated {
                 remote: format!("{remote}/{rel}"),
                 want: size,
                 got: size - remaining,
-            });
+            };
+            progress.subtract_bytes(counted);
+            return Err(error);
         }
         file.write_all(&buf[..n])?;
+        count(n as u64);
         remaining -= n as u64;
     }
-    Ok(Via::Copy)
+    Ok((counted, Via::Copy))
 }
 
 /// Discard a record whose size disagrees with the manifest, keeping the rest
@@ -521,6 +558,7 @@ mod tests {
             "sub",
             &target,
             vec![("a.txt".to_string(), 3), ("b.txt".to_string(), 3)],
+            SharedProgress::hidden(),
         )
         .await
         .unwrap();
@@ -563,6 +601,7 @@ mod tests {
             "partial",
             &mut reader,
             &mut copy_buf,
+            &SharedProgress::hidden(),
         )
         .unwrap_err();
         assert!(matches!(

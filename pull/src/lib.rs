@@ -28,6 +28,7 @@ mod args;
 mod error;
 mod fetch;
 mod http;
+mod progress;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod splice;
 mod streaming;
@@ -37,6 +38,7 @@ pub use error::{BoxError, Error};
 use crate::args::{Kind, Parsed, parse_args};
 use crate::fetch::{ManifestEntry, Via, fetch_file, fetch_manifest};
 use crate::http::Pool;
+use crate::progress::SharedProgress;
 use crate::streaming::fetch_stream_shard;
 use std::{
     collections::HashMap,
@@ -83,6 +85,7 @@ struct Stats {
     ///
     /// 单独记一档，是为了让"本次真正传输多少"和"本地已符合条件跳过多少"不混在一起。
     skipped: u64,
+    skipped_bytes: u64,
 }
 
 /// 落盘文件按正文搬运方式分类的文件数。
@@ -144,6 +147,7 @@ fn to_not_found(error: Error, remote: &str) -> Error {
 /// 清单模式：一次取 manifest，目录先建好，文件按目录亲和分片并发拉。
 async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
     let target = local_target(&p.local, &p.remote, p.flat);
+    eprintln!("lanfile get: 获取目录清单...");
     let entries = match fetch_manifest(pool, &p.host, &p.remote).await {
         Ok(entries) => entries,
         Err(Error::Http { status: 404, .. }) if fallback_file => {
@@ -153,7 +157,7 @@ async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<()
     };
     let (stats, files) = prepare_manifest(&target, &entries).await?;
     let (stream_stats, failures) =
-        pull_stream_shards(pool, &p.host, &p.remote, &target, files).await?;
+        pull_stream_shards(pool, &p.host, &p.remote, &target, files, &stats).await?;
     let via = ViaCounts::from_stream(&stream_stats);
     eprintln!(
         "lanfile get: {}/{} -> {}（清单分片流：{} 文件，{} 目录，{} 字节，跳过已存在 {} 个）",
@@ -238,13 +242,17 @@ async fn prepare_manifest(
     tokio::fs::create_dir_all(local).await?;
     let mut stats = Stats::default();
     let mut files = HashMap::with_capacity(entries.len() / 2);
+    let total_dirs = entries.iter().filter(|entry| entry.is_dir()).count() as u64;
+    let progress = SharedProgress::new("创建目录", "个目录", total_dirs, 0);
     for entry in entries {
         if entry.is_dir() {
             tokio::fs::create_dir_all(local.join(&entry.path)).await?;
             stats.dirs += 1;
+            progress.add_dir();
         } else if let Some(size) = entry.size {
             if skip_existing(&local.join(&entry.path), Some(size)).await {
                 stats.skipped += 1;
+                stats.skipped_bytes += size;
             } else {
                 files.insert(entry.path.clone(), size);
             }
@@ -252,6 +260,7 @@ async fn prepare_manifest(
             return Err(Error::Malformed("清单文件缺少大小"));
         }
     }
+    progress.finish();
     Ok((stats, files))
 }
 
@@ -262,15 +271,28 @@ async fn pull_stream_shards(
     remote: &str,
     local: &Path,
     mut files: HashMap<String, u64>,
+    stats: &Stats,
 ) -> Result<(crate::streaming::StreamStats, Vec<String>), Error> {
     let shards = build_shard_tasks(&mut files);
+    let total_files = shards.iter().flatten().count() as u64 + stats.skipped;
+    let total_bytes = shards
+        .iter()
+        .flatten()
+        .map(|(_, size)| size)
+        .sum::<u64>()
+        .saturating_add(stats.skipped_bytes);
+    let progress = SharedProgress::new("拉取文件", "个文件", total_files, total_bytes);
+    progress.complete_existing(stats.skipped, stats.skipped_bytes);
 
     let mut tasks = Vec::with_capacity(STREAM_SHARDS as usize);
     for expected in shards {
         let host = host.to_string();
         let remote = remote.to_string();
         let local = local.to_path_buf();
-        tasks.push(async move { fetch_stream_shard(&host, &remote, &local, expected).await });
+        let progress = progress.clone();
+        tasks.push(
+            async move { fetch_stream_shard(&host, &remote, &local, expected, progress).await },
+        );
     }
     let results = futures_util::future::try_join_all(tasks).await?;
     let mut stats = crate::streaming::StreamStats::default();
@@ -286,8 +308,10 @@ async fn pull_stream_shards(
         local,
         retry_files.into_iter().collect(),
         &mut stats,
+        &progress,
     )
     .await;
+    progress.finish();
     Ok((stats, failures))
 }
 
@@ -299,6 +323,7 @@ async fn retry_failed_files(
     local: &Path,
     files: Vec<String>,
     stats: &mut crate::streaming::StreamStats,
+    progress: &SharedProgress,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for rel in files {
@@ -313,6 +338,7 @@ async fn retry_failed_files(
                 Ok(fetched) => {
                     stats.files += 1;
                     stats.bytes += fetched.bytes;
+                    progress.finish_file(fetched.bytes);
                     match fetched.via {
                         Via::Splice => stats.spliced += 1,
                         Via::Copy => stats.copied += 1,
@@ -527,6 +553,7 @@ mod tests {
             &local,
             vec!["bad.txt".to_string()],
             &mut stats,
+            &SharedProgress::hidden(),
         )
         .await;
 
