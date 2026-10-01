@@ -647,14 +647,13 @@ fn serve_stream_batch_inner(
         return Ok(());
     };
 
-    socket.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-    )?;
-
     // 生产线程把已打开的文件交过来；发送回调出错时返回 `false` 并退出接收循环。
     let mut error: Option<std::io::Error> = None;
     // 头 + 小文件内容的攒批缓冲。小于阈值的小文件内容也读进来，跟头一起写出。
     let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
+    head_buf.extend_from_slice(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+    );
     let mut copy_buf = Vec::new();
 
     let mut send_entry = |entry: StreamFile| {
