@@ -1,31 +1,32 @@
-//! Vendored copy of `salvo_core::fs::NamedFile` without the blocking-pool hop.
+//! Vendored copy of `salvo_core::fs::NamedFile` without its build-time
+//! blocking-pool hop.
 //!
 //! 本 crate 是 `salvo_core-1.0.0/src/fs/named_file.rs`（以及 `fs.rs` 里的
-//! `ChunkedFile`）的拷贝。行为改动是内部两处 `spawn_blocking` 换成同步调用；
+//! `ChunkedFile`）的拷贝。行为改动是构建阶段的 `spawn_blocking` 换成同步调用；
 //! 在此之上为本项目加了几处接口（[`FileMeta`]、`Arc<File>`/`Arc<Path>` 共享、
 //! `build_from_file_with_metadata`、[`NamedFile::set_etag`]、`builder_shared`、
 //! `content_type()` 返回 `Arc<Mime>`），这些行与上游不再逐行一致，其余是上游
 //! 的逻辑。
 //!
 //! This crate is a copy of `salvo_core-1.0.0/src/fs/named_file.rs` (plus the
-//! `ChunkedFile` type from `fs.rs`). The behavioural change is that both
-//! internal `spawn_blocking` calls become synchronous; on top of that this
+//! `ChunkedFile` type from `fs.rs`). The behavioural change is that the
+//! build-time `spawn_blocking` becomes synchronous; on top of that this
 //! project added a few interfaces ([`FileMeta`], `Arc<File>`/`Arc<Path>`
 //! sharing, `build_from_file_with_metadata`, [`NamedFile::set_etag`],
 //! `builder_shared`, and `content_type()` returning `Arc<Mime>`), so those lines
 //! no longer match upstream while the rest is upstream's logic.
 //!
-//! 上游 `build()` 把 open/metadata/预读放进 `spawn_blocking`，`send_inner()`
-//! 又用 `File::into_std().await` 拿回 `std::fs::File` 去构造 `ChunkedFile`。
+//! 上游 `build()` 把 open/metadata/预读放进 `spawn_blocking`。流式正文仍由
+//! `ChunkedFile` 按块派发到 blocking pool。
 //! 本项目的 `/files` 是热路径，而 tokio 的 blocking pool 只有一把全局
-//! `Mutex` + `Condvar`，压测显示这两次派发合计占掉每请求约 7 次 futex 等待，
+//! `Mutex` + `Condvar`，压测显示这次派发占掉每请求约 4 次 futex 等待，
 //! 比它们省下的阻塞还贵。
 //!
-//! Upstream `build()` wraps open/metadata/preread in `spawn_blocking`, and
-//! `send_inner()` calls `File::into_std().await` to get back a `std::fs::File`
-//! for `ChunkedFile`. `/files` is this project's hot path, and tokio's blocking
-//! pool has a single global `Mutex` plus `Condvar`; benchmarking shows the two
-//! dispatches together cost about seven futex waits per request, more than the
+//! Upstream `build()` wraps open/metadata/preread in `spawn_blocking`; streamed
+//! bodies still use `ChunkedFile` and its per-chunk blocking dispatch.
+//! `/files` is this project's hot path, and tokio's blocking
+//! pool has a single global `Mutex` plus `Condvar`; benchmarking shows the
+//! build dispatch costs about four futex waits per request, more than the
 //! blocking they avoid.
 //!
 //! 因此 [`NamedFile`] 直接持有 `std::fs::File`，不再包一层 `tokio::fs::File`，
@@ -580,7 +581,23 @@ impl NamedFileBuilder {
             file: Arc<File>,
             metadata: FileMeta,
             preread: Option<Vec<u8>>,
-            detection_sample: Option<Vec<u8>>,
+            detection_sample: DetectionSample,
+        }
+
+        enum DetectionSample {
+            Empty,
+            Preread(usize),
+            Owned(Vec<u8>),
+        }
+
+        impl DetectionSample {
+            fn as_slice<'a>(&'a self, preread: &'a [u8]) -> &'a [u8] {
+                match self {
+                    Self::Empty => &[],
+                    Self::Preread(end) => &preread[..*end],
+                    Self::Owned(sample) => sample,
+                }
+            }
         }
         let info = (|| -> std::io::Result<FileInfo> {
             // 调用方可能已经打开过这个文件（例如用 openat2 解析过路径），那就直接用它，
@@ -614,9 +631,10 @@ impl NamedFileBuilder {
                 None
             };
 
-            let detection_sample = if needs_detection_sample {
+            let mut detection_sample = DetectionSample::Empty;
+            if needs_detection_sample {
                 if let Some(preread) = &preread {
-                    Some(preread[..cmp::min(1024, preread.len())].to_vec())
+                    detection_sample = DetectionSample::Preread(cmp::min(1024, preread.len()));
                 } else {
                     let mut sample = vec![0u8; cmp::min(1024, file_size) as usize];
                     // 用 pread 读、不动文件偏移量：调用方可能把同一个 fd 缓存下来给多个请求
@@ -629,11 +647,9 @@ impl NamedFileBuilder {
                         owned.seek(SeekFrom::Start(0))?;
                         owned.read_exact(&mut sample)?;
                     }
-                    Some(sample)
+                    detection_sample = DetectionSample::Owned(sample);
                 }
-            } else {
-                None
-            };
+            }
 
             Ok(FileInfo {
                 file,
@@ -651,14 +667,18 @@ impl NamedFileBuilder {
         let content_type = if let Some(mime) = inferred_mime {
             if needs_charset {
                 let mut mime = (*mime).clone();
-                let sample = info.detection_sample.as_deref().unwrap_or(&[]);
+                let sample = info
+                    .detection_sample
+                    .as_slice(info.preread.as_deref().unwrap_or(&[]));
                 fill_mime_charset_if_need(&mut mime, sample);
                 Arc::new(mime)
             } else {
                 mime
             }
         } else if needs_detect {
-            let sample = info.detection_sample.as_deref().unwrap_or(&[]);
+            let sample = info
+                .detection_sample
+                .as_slice(info.preread.as_deref().unwrap_or(&[]));
             Arc::new(detect_text_mime(sample).unwrap_or(mime::APPLICATION_OCTET_STREAM))
         } else {
             Arc::new(mime::APPLICATION_OCTET_STREAM)
@@ -821,9 +841,7 @@ const CONTENT_CODED_EXTS: &[(&str, &str)] = &[
 /// that without also advertising the coding hands the client compressed bytes
 /// labelled as an SVG document, which it cannot render.
 ///
-/// [`NamedFile`] applies this itself. It is public so a handler that picks a file
-/// to serve can tell that the file already carries a coding — a precompressed
-/// variant of a `.svgz` would stack a second coding on top of the gzip.
+/// [`NamedFile`] applies this when building a response.
 ///
 /// The extension is matched case-insensitively, as `mime_infer` matches it.
 #[must_use]

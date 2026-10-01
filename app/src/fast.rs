@@ -177,6 +177,17 @@ impl HyperService<HyperRequest<Incoming>> for FastService {
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 const STREAM_BATCH_PREFIX: &str = "/stream-batch/";
 const MAX_STREAM_BATCH_BODY: usize = 64 * 1024 * 1024;
+const MAX_STREAM_BATCH_HEAD: usize = 16 * 1024;
+const STREAM_BATCH_READ_BUF: usize = 4096;
+const HEAD_END: &[u8; 4] = b"\r\n\r\n";
+
+/// Returns the target of an HTTP request line.
+fn request_target(line: &[u8]) -> Option<&[u8]> {
+    let method_end = line.iter().position(|&byte| byte == b' ')?;
+    let rest = &line[method_end + 1..];
+    let target_end = rest.iter().position(|&byte| byte == b' ')?;
+    Some(&rest[..target_end])
+}
 
 /// 看请求行是不是 `/stream-batch/...`。
 ///
@@ -192,15 +203,7 @@ async fn is_stream_batch_request(conn: &tokio::net::TcpStream) -> bool {
         return false;
     };
     let line = &buf[..line_end];
-    // GET /stream-batch/... HTTP/1.1
-    let Some(space1) = line.iter().position(|&b| b == b' ') else {
-        return false;
-    };
-    let rest = &line[space1 + 1..];
-    let Some(space2) = rest.iter().position(|&b| b == b' ') else {
-        return false;
-    };
-    rest[..space2].starts_with(STREAM_BATCH_PREFIX.as_bytes())
+    request_target(line).is_some_and(|target| target.starts_with(STREAM_BATCH_PREFIX.as_bytes()))
 }
 
 /// 处理一条 `/stream-batch/` 连接：读请求头、解析路径、读请求体并发送文件。
@@ -220,33 +223,20 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
-    // 读请求头，到空行为止
-    let mut head = Vec::with_capacity(1024);
-    let mut byte = [0_u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Ok(()); // 客户端没发完整请求就挂了
-        }
-        head.push(byte[0]);
-        if head.len() > 16_384 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "请求头过长"));
-        }
+    let (head, head_len) = read_request_head(&mut stream)?;
+    if head_len == 0 {
+        return Ok(());
     }
 
     // 解析请求行，取路径
-    let Some(line_end) = head.windows(2).position(|w| w == b"\r\n") else {
+    let Some(line_end) = head[..head_len].windows(2).position(|w| w == b"\r\n") else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行未终止"));
     };
     let line = &head[..line_end];
-    let Some(space1) = line.iter().position(|&b| b == b' ') else {
+    let Some(target) = request_target(line) else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行格式异常"));
     };
-    let rest = &line[space1 + 1..];
-    let Some(space2) = rest.iter().position(|&b| b == b' ') else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行格式异常"));
-    };
-    let path = std::str::from_utf8(&rest[..space2])
+    let path = std::str::from_utf8(target)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "请求路径不是 UTF-8"))?;
     let Some(encoded_target) = path.strip_prefix(STREAM_BATCH_PREFIX) else {
         return Err(io::Error::new(
@@ -256,13 +246,47 @@ fn handle_stream_blocking(mut stream: StdTcpStream, root: &Path) -> io::Result<(
     };
 
     let decoded = decode_url_path(encoded_target);
-    let body = read_request_body(&mut stream, &head)?;
+    let body = read_request_body(&mut stream, &head, head_len)?;
     lanfile_list::serve_stream_batch(&mut stream, root, &decoded, &body)
 }
 
-fn read_request_body(stream: &mut StdTcpStream, head: &[u8]) -> io::Result<Vec<u8>> {
+/// Reads the request head in blocks and returns all bytes read plus the length
+/// of the head itself. Bytes after the terminator may already be in the buffer
+/// and are left for the body reader.
+fn read_request_head(stream: &mut StdTcpStream) -> io::Result<(Vec<u8>, usize)> {
+    let mut head = Vec::with_capacity(STREAM_BATCH_READ_BUF);
+    let mut chunk = [0_u8; STREAM_BATCH_READ_BUF];
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let search_start = head.len().saturating_sub(HEAD_END.len() - 1);
+        head.extend_from_slice(&chunk[..read]);
+        if let Some(end) = find_head_end(&head, search_start) {
+            return Ok((head, end + 1));
+        }
+        if head.len() > MAX_STREAM_BATCH_HEAD {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "请求头过长"));
+        }
+    }
+}
+
+fn find_head_end(input: &[u8], from: usize) -> Option<usize> {
+    input
+        .get(from..)?
+        .windows(HEAD_END.len())
+        .position(|window| window == HEAD_END)
+        .map(|at| from + at + HEAD_END.len() - 1)
+}
+
+fn read_request_body(
+    stream: &mut StdTcpStream,
+    head: &[u8],
+    head_len: usize,
+) -> io::Result<Vec<u8>> {
     let mut length = None;
-    for line in head.split(|&byte| byte == b'\n') {
+    for line in head[..head_len].split(|&byte| byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
             if length.is_some() {
@@ -285,8 +309,11 @@ fn read_request_body(stream: &mut StdTcpStream, head: &[u8]) -> io::Result<Vec<u
             "stream-batch 请求体过大",
         ));
     }
-    let mut body = vec![0_u8; length];
-    stream.read_exact(&mut body)?;
+    let received = head.get(head_len..).unwrap_or_default();
+    let take = received.len().min(length);
+    let mut body = Vec::with_capacity(length);
+    body.extend_from_slice(&received[..take]);
+    stream.read_exact(&mut body[take..])?;
     Ok(body)
 }
 

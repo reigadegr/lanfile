@@ -175,7 +175,7 @@ fn take_content_length(line: &str, content_length: &mut Option<u64>) -> Result<(
 /// 先用 `memchr` 定位版本号后那个空格，再在剩下的一小段里取词：比
 /// `split_whitespace().nth(1)` 少一整层 `Pattern` 与迭代器分发（基准见 `bench_status_code`）。
 /// 仍按任意 ASCII 空白切分，与原来的宽容度一致。
-fn status_code(line: &str) -> Option<u16> {
+pub fn status_code(line: &str) -> Option<u16> {
     let bytes = line.as_bytes();
     let rest = &bytes[memchr::memchr(b' ', bytes)? + 1..];
     let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;

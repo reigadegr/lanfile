@@ -73,6 +73,9 @@ pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// Fallback for platforms without `openat2`. This confines the resolved path to
+/// `dir`, but unlike the Unix fast path it does not reject a final symlink whose
+/// canonicalized target remains under `dir`.
 pub fn open_file_under(dir: &Path, rel: &str) -> Option<(File, u64)> {
     let path = dir.join(rel);
     let canonical = path.canonicalize().ok()?;

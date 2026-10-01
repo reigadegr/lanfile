@@ -24,7 +24,7 @@ use std::{
 
 use crate::error::Error;
 use crate::fetch::{Via, encode_path};
-use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT};
+use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT, status_code};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::splice::{Moved, transfer};
 
@@ -33,6 +33,7 @@ use crate::splice::{Moved, transfer};
 /// 头部分（类型 + 路径 + 长度）每条不到一百字节，一次 `read` 能覆盖几十条；正文超过
 /// 这个缓冲时剩余的走 `splice`，缓冲区里的那部分照常落盘。
 const STREAM_READ_BUF: usize = 64 * 1024;
+const MAX_RESPONSE_HEAD: usize = 16 * 1024;
 
 /// 一次流式拉取的统计。
 #[derive(Default)]
@@ -72,7 +73,8 @@ pub async fn fetch_stream_shard(
     let host_owned = host.to_string();
     let remote_owned = remote.to_string();
     let target_owned = target.to_path_buf();
-    let mut request_body = Vec::new();
+    let request_body_len = entries.iter().map(|(path, _)| path.len() + 1).sum();
+    let mut request_body = Vec::with_capacity(request_body_len);
     for (path, _) in &entries {
         request_body.extend_from_slice(path.as_bytes());
         request_body.push(0);
@@ -116,7 +118,8 @@ fn fetch_stream_blocking(
     stream.write_all(request.as_bytes())?;
     stream.write_all(request_body)?;
 
-    let status = read_response_head(&mut stream)?;
+    let mut reader = BufferedSocket::new(&stream);
+    let status = reader.read_response_head()?;
     if status != 200 {
         return Err(Error::Http {
             status,
@@ -127,8 +130,8 @@ fn fetch_stream_blocking(
     std::fs::create_dir_all(target)?;
     let mut stats = StreamStats::default();
     let mut path_buf = Vec::with_capacity(256);
-    let mut reader = BufferedSocket::new(&stream);
     let mut made_dirs = HashSet::<PathBuf>::from([target.to_path_buf()]);
+    let mut copy_buf = Vec::new();
 
     loop {
         // 1 字节类型；干净 EOF 视作收尾
@@ -150,8 +153,7 @@ fn fetch_stream_blocking(
             return Err(Error::Malformed("远端返回了非法的相对路径"));
         }
         let rel = std::str::from_utf8(&path_buf)
-            .map_err(|_| Error::Malformed("远端返回的路径不是合法 UTF-8"))?
-            .to_owned();
+            .map_err(|_| Error::Malformed("远端返回的路径不是合法 UTF-8"))?;
 
         match kind[0] {
             0 => {
@@ -161,13 +163,21 @@ fn fetch_stream_blocking(
                 let mut size_buf = [0_u8; 8];
                 reader.read_exact(&mut size_buf)?;
                 let size = u64::from_le_bytes(size_buf);
-                check_expected(&mut expected, &rel, size)?;
-                let file_path = target.join(&rel);
+                check_expected(&mut expected, rel, size)?;
+                let file_path = target.join(rel);
                 if let Some(parent) = file_path.parent() {
                     ensure_dir(parent, &mut made_dirs)?;
                 }
                 let file = File::create(&file_path)?;
-                match stream_file_content(&stream, &file, size, remote, &rel, &mut reader) {
+                match stream_file_content(
+                    &stream,
+                    &file,
+                    size,
+                    remote,
+                    rel,
+                    &mut reader,
+                    &mut copy_buf,
+                ) {
                     Ok(via) => {
                         match via {
                             Via::Splice => stats.spliced += 1,
@@ -234,12 +244,13 @@ fn ensure_dir(path: &Path, made_dirs: &mut HashSet<PathBuf>) -> io::Result<()> {
 /// 缓冲区里已有的正文先落盘（通常是上一次 `fill` 顺手读进来的），剩余的直接
 /// `splice(2)` 进文件，不再经过用户态。
 fn stream_file_content(
-    socket: &TcpStream,
-    file: &File,
+    mut socket: &TcpStream,
+    mut file: &File,
     size: u64,
     remote: &str,
     rel: &str,
     reader: &mut BufferedSocket<'_>,
+    copy_buf: &mut Vec<u8>,
 ) -> Result<Via, Error> {
     if size == 0 {
         return Ok(Via::Prebuffered);
@@ -270,13 +281,14 @@ fn stream_file_content(
     }
 
     // 非 Linux/Android，或目标文件系统不支持 splice_write：用户态读写兜底
-    let mut buf = vec![0_u8; 64 * 1024];
     let mut remaining = remaining;
-    let mut socket_ref = socket;
-    let mut file_ref = file;
+    if copy_buf.len() != STREAM_READ_BUF {
+        copy_buf.resize(STREAM_READ_BUF, 0);
+    }
+    let buf = &mut copy_buf[..];
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
-        let n = socket_ref.read(&mut buf[..want])?;
+        let n = socket.read(&mut buf[..want])?;
         if n == 0 {
             return Err(Error::Truncated {
                 remote: format!("{remote}/{rel}"),
@@ -284,7 +296,7 @@ fn stream_file_content(
                 got: size - remaining,
             });
         }
-        file_ref.write_all(&buf[..n])?;
+        file.write_all(&buf[..n])?;
         remaining -= n as u64;
     }
     Ok(Via::Copy)
@@ -313,6 +325,48 @@ impl<'a> BufferedSocket<'a> {
             start: 0,
             end: 0,
         }
+    }
+
+    /// Reads a response head into the existing buffer, leaving any pre-read
+    /// body bytes available for the record decoder.
+    fn read_response_head(&mut self) -> Result<u16, Error> {
+        let mut search_from = self.start;
+        let head_end = loop {
+            let found = self.buf[search_from..self.end]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|at| search_from + at + 4);
+            if let Some(head_end) = found {
+                if head_end - self.start > MAX_RESPONSE_HEAD {
+                    return Err(Error::Malformed("响应头过长"));
+                }
+                break head_end;
+            }
+            if self.end == self.buf.len() {
+                return Err(Error::Malformed("响应头过长"));
+            }
+            let read = self
+                .socket
+                .read(&mut self.buf[self.end..])
+                .map_err(Error::from)?;
+            if read == 0 {
+                return Err(Error::Malformed("响应头提前结束"));
+            }
+            search_from = self.end.saturating_sub(3).max(search_from);
+            self.end += read;
+            if self.end > MAX_RESPONSE_HEAD {
+                return Err(Error::Malformed("响应头过长"));
+            }
+        };
+        let head = &self.buf[self.start..head_end];
+        let Some(line_end) = head.windows(2).position(|window| window == b"\r\n") else {
+            return Err(Error::Malformed("状态行未终止"));
+        };
+        let line = std::str::from_utf8(&head[..line_end])
+            .map_err(|_| Error::Malformed("状态行不是 UTF-8"))?;
+        let status = status_code(line).ok_or(Error::Malformed("状态行格式异常"))?;
+        self.start = head_end;
+        Ok(status)
     }
 
     /// 从 socket 读一块进缓冲区；返回是否读到数据（`false` 表示 EOF）。
@@ -371,42 +425,6 @@ impl<'a> BufferedSocket<'a> {
     }
 }
 
-/// 读状态行 + 跳响应头，返回状态码。响应头里的 `Content-Length` 用不到（服务端不发长度、
-/// 靠 `Connection: close` 后的 EOF 收尾），所以整个头读完就丢。
-fn read_response_head(stream: &mut TcpStream) -> Result<u16, Error> {
-    let mut buf = Vec::with_capacity(512);
-    let mut byte = [0_u8; 1];
-    while !buf.ends_with(b"\r\n\r\n") {
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Err(Error::Malformed("响应头提前结束"));
-        }
-        buf.push(byte[0]);
-        if buf.len() > 16384 {
-            return Err(Error::Malformed("响应头过长"));
-        }
-    }
-    let Some(line_end) = buf.windows(2).position(|w| w == b"\r\n") else {
-        return Err(Error::Malformed("状态行未终止"));
-    };
-    let line =
-        std::str::from_utf8(&buf[..line_end]).map_err(|_| Error::Malformed("状态行不是 UTF-8"))?;
-    parse_status(line).ok_or(Error::Malformed("状态行格式异常"))
-}
-
-/// 从 `HTTP/1.1 200 OK` 里取状态码。与 `http.rs` 的实现一致（`memchr` 定位版本号后的空格）。
-fn parse_status(line: &str) -> Option<u16> {
-    let bytes = line.as_bytes();
-    let rest = &bytes[memchr::memchr(b' ', bytes)? + 1..];
-    let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;
-    let token = &rest[start..];
-    let end = token
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(token.len());
-    std::str::from_utf8(&token[..end]).ok()?.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -431,8 +449,17 @@ mod tests {
         let file = File::create(&file_path).unwrap();
         let mut reader = BufferedSocket::new(&stream);
 
-        let error =
-            stream_file_content(&stream, &file, 4, "remote", "partial", &mut reader).unwrap_err();
+        let mut copy_buf = Vec::new();
+        let error = stream_file_content(
+            &stream,
+            &file,
+            4,
+            "remote",
+            "partial",
+            &mut reader,
+            &mut copy_buf,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             Error::Truncated {

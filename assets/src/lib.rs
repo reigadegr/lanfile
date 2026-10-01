@@ -143,15 +143,7 @@ impl ServeFiles {
             return Some((joined, file, metadata, Some(headers)));
         }
         let joined = self.root.join(sub);
-        let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
-            // 路径已经不存在了，顺手把缓存里占着的 fd 放掉
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            self.cache.remove(sub);
-            return None;
-        };
-        if !metadata.is_file() {
-            return None;
-        }
+        let metadata = self.regular_metadata(sub, &joined, true)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some((joined, file, metadata, headers)) = self.cache.get(sub, &metadata) {
             return Some((joined, file, metadata, Some(headers)));
@@ -167,14 +159,30 @@ impl ServeFiles {
     /// 整段跳过 [`FileCache`]，只保留防穿越的路径解析与一次 `fstat`。
     fn open_no_cache(&self, sub: &str) -> Option<(Arc<Path>, Arc<File>, FileMeta)> {
         let joined = self.root.join(sub);
-        let Ok(metadata) = std::fs::symlink_metadata(&joined) else {
-            return None;
-        };
-        if !metadata.is_file() {
-            return None;
-        }
+        self.regular_metadata(sub, &joined, false)?;
         let (file, metadata) = self.open_confirmed(sub, &joined)?;
         Some((Arc::from(joined), file, metadata))
+    }
+
+    /// Returns path metadata after confirming that the path names a regular file.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        allow(unused_variables)
+    )]
+    fn regular_metadata(
+        &self,
+        sub: &str,
+        joined: &Path,
+        evict_stale: bool,
+    ) -> Option<std::fs::Metadata> {
+        let Ok(metadata) = std::fs::symlink_metadata(joined) else {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if evict_stale {
+                self.cache.remove(sub);
+            }
+            return None;
+        };
+        metadata.is_file().then_some(metadata)
     }
 
     /// 已确认路径是普通文件之后：打开、取 fd 自己的元数据、下顺序读提示。

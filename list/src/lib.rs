@@ -651,6 +651,7 @@ fn serve_stream_batch_inner(
     let mut error: Option<std::io::Error> = None;
     // 头 + 小文件内容的攒批缓冲。小于阈值的小文件内容也读进来，跟头一起写出。
     let mut head_buf: Vec<u8> = Vec::with_capacity(STREAM_BUF);
+    let mut copy_buf = Vec::new();
 
     let mut send_entry = |entry| {
         if error.is_some() {
@@ -691,7 +692,7 @@ fn serve_stream_batch_inner(
                         // 对端缓冲，不会跟随后的 sendfile 抢一个 MSS 段。
                         socket.write_all(&head_buf)?;
                         head_buf.clear();
-                        sendfile_all(socket, &file, size)?;
+                        sendfile_all(socket, &file, size, &mut copy_buf)?;
                     }
                 }
             }
@@ -754,10 +755,13 @@ fn copy_user(
     file: &File,
     offset: u64,
     remaining: u64,
+    buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
-    let mut buf = vec![0_u8; 64 * 1024];
     let mut offset = offset;
     let mut remaining = remaining;
+    if buf.len() != STREAM_BUF {
+        buf.resize(STREAM_BUF, 0);
+    }
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
         let n = read_at(file, &mut buf[..want], offset)?;
@@ -797,7 +801,12 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
 /// `EOPNOTSUPP`，已经搬走的字节数保留在 `offset` 里，剩下的交给 [`copy_user`] 继续——
 /// 这样即便根目录挂在 fuse 上，`/stream-batch` 也不会中途断连。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<()> {
+fn sendfile_all(
+    socket: &TcpStream,
+    file: &File,
+    size: u64,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
     let mut offset = 0_u64;
     let mut remaining = size;
     while remaining > 0 {
@@ -817,7 +826,7 @@ fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<(
                     || e == rustix::io::Errno::NOSYS
                     || e == rustix::io::Errno::OPNOTSUPP =>
             {
-                return copy_user(socket, file, offset, remaining);
+                return copy_user(socket, file, offset, remaining, buf);
             }
             Err(e) => return Err(e.into()),
         }
@@ -826,8 +835,13 @@ fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn sendfile_all(socket: &TcpStream, file: &File, size: u64) -> std::io::Result<()> {
-    copy_user(socket, file, 0, size)
+fn sendfile_all(
+    socket: &TcpStream,
+    file: &File,
+    size: u64,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    copy_user(socket, file, 0, size, buf)
 }
 
 /// 发一个文件：装得下一块就走整条目写入，否则流式分块。返回是否应继续遍历。
