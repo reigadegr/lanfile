@@ -8,8 +8,6 @@ use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::collections::HashMap;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::Arc;
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
@@ -34,7 +32,7 @@ pub fn open_dir(dir: &Path) -> Option<OwnedFd> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub struct BatchFileOpener {
     root: Arc<OwnedFd>,
-    dirs: HashMap<String, Arc<OwnedFd>>,
+    cached_parent: Option<(String, Arc<OwnedFd>)>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -43,7 +41,7 @@ impl BatchFileOpener {
     pub fn new(root: OwnedFd) -> Self {
         Self {
             root: Arc::new(root),
-            dirs: HashMap::new(),
+            cached_parent: None,
         }
     }
 
@@ -73,19 +71,14 @@ impl BatchFileOpener {
         let Some((parents, _)) = rel.rsplit_once('/') else {
             return Some(Arc::clone(&self.root));
         };
+        if let Some((cached, fd)) = &self.cached_parent
+            && cached == parents
+        {
+            return Some(Arc::clone(fd));
+        }
 
         let mut current = Arc::clone(&self.root);
-        let mut prefix = String::new();
         for component in parents.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(component);
-            if let Some(cached) = self.dirs.get(&prefix) {
-                current = Arc::clone(cached);
-                continue;
-            }
-
             let child = rfs::openat(
                 &current,
                 component,
@@ -93,10 +86,9 @@ impl BatchFileOpener {
                 Mode::empty(),
             )
             .ok()?;
-            let child = Arc::new(child);
-            self.dirs.insert(prefix.clone(), Arc::clone(&child));
-            current = child;
+            current = Arc::new(child);
         }
+        self.cached_parent = Some((parents.to_owned(), Arc::clone(&current)));
         Some(current)
     }
 }
@@ -356,6 +348,33 @@ mod tests {
         assert!(opener.open_file("nested/final.txt").is_none());
         assert!(opener.open_file("intermediate/outside.txt").is_none());
         assert!(opener.open_file("../outside.txt").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn batch_opener_keeps_only_current_parent_cached() {
+        let base = tmp_root("batch-cache");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("file.txt"), "x").unwrap();
+        }
+
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let mut opener = BatchFileOpener::new(open_dir(&root).unwrap());
+        for name in ["one", "two", "three"] {
+            assert!(opener.open_file(&format!("{name}/file.txt")).is_some());
+        }
+        let cached_fds = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.unwrap().path()).ok())
+            .filter(|path| path.starts_with(&canonical_root))
+            .count();
+        assert_eq!(cached_fds, 2);
 
         let _ = std::fs::remove_dir_all(&base);
     }
