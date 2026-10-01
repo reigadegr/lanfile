@@ -39,7 +39,7 @@ use crate::fetch::{ManifestEntry, Via, fetch_file, fetch_manifest};
 use crate::http::Pool;
 use crate::streaming::fetch_stream_shard;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
@@ -344,39 +344,38 @@ struct ShardTask {
 /// 大目录拆成连续小块，避免一个目录拖慢单个 shard；大文件无法在当前协议内拆块，
 /// 会作为独立任务优先放到最空的 shard。
 fn build_shard_tasks(files: &mut HashMap<String, u64>) -> Vec<Vec<(String, u64)>> {
-    let mut directories: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
-    for (path, size) in files.drain() {
-        let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
-        directories
-            .entry(directory.to_owned())
-            .or_default()
-            .push((path, size));
+    fn parent(path: &str) -> &str {
+        match path.rsplit_once('/') {
+            Some((parent, _)) => parent,
+            None => "",
+        }
     }
 
+    let mut files = Vec::from_iter(files.drain());
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut tasks = Vec::new();
-    for (_, mut group) in directories {
-        group.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut current = ShardTask {
-            files: Vec::new(),
-            bytes: 0,
-        };
-        for file @ (_, size) in group {
-            if !current.files.is_empty()
-                && (current.files.len() >= STREAM_TASK_MAX_FILES
-                    || current.bytes.saturating_add(size) > STREAM_TASK_MAX_BYTES)
-            {
-                tasks.push(current);
-                current = ShardTask {
-                    files: Vec::new(),
-                    bytes: 0,
-                };
-            }
-            current.bytes += size;
-            current.files.push(file);
-        }
-        if !current.files.is_empty() {
+    let mut current = ShardTask {
+        files: Vec::new(),
+        bytes: 0,
+    };
+    for file in files {
+        let (path, size) = &file;
+        if !current.files.is_empty()
+            && (current.files.len() >= STREAM_TASK_MAX_FILES
+                || current.bytes.saturating_add(*size) > STREAM_TASK_MAX_BYTES
+                || parent(&current.files[0].0) != parent(path))
+        {
             tasks.push(current);
+            current = ShardTask {
+                files: Vec::new(),
+                bytes: 0,
+            }
         }
+        current.bytes += *size;
+        current.files.push(file);
+    }
+    if !current.files.is_empty() {
+        tasks.push(current);
     }
 
     // 最长处理时间优先：大任务先落位，小任务填空，减少尾部等待。
@@ -488,8 +487,13 @@ mod tests {
             .map(|files| files.iter().map(|(_, size)| size).sum::<u64>())
             .collect::<Vec<_>>();
         let count = shards.iter().map(Vec::len).sum::<usize>();
+        let paths = shards
+            .iter()
+            .flat_map(|files| files.iter().map(|(path, _)| path.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(count, 32);
+        assert_eq!(paths.len(), 32);
         assert_eq!(loads, [80, 80, 80, 80]);
         assert!(files.is_empty());
     }
