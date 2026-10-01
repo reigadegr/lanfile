@@ -307,6 +307,7 @@ fn stream_file_content(
     // 也可能装了全部（小文件），取两者的最小值。
     let from_buf = reader.available().min(size as usize);
     if from_buf > 0 {
+        chunks.add(from_buf as u64);
         reader.consume_to(from_buf, file)?;
     }
     let remaining = size - from_buf as u64;
@@ -619,6 +620,55 @@ mod tests {
         assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"yyy");
         server.await.unwrap();
         std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn chunk_progress_finish_counts_flushed_bytes() {
+        let progress = SharedProgress::new("拉取文件", "个文件", 1, 730);
+        let mut chunks = ChunkProgress::new(&progress);
+        chunks.add(700);
+        chunks.flush();
+        chunks.add(30);
+        chunks.finish();
+
+        assert_eq!(progress.counts(), (1, 730));
+    }
+
+    #[test]
+    fn stream_file_content_counts_prebuffered_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+
+        peer.write_all(b"7 bytes").unwrap();
+        drop(peer);
+
+        let root =
+            std::env::temp_dir().join(format!("lanfile-stream-buffered-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("buffered");
+        let file = File::create(&file_path).unwrap();
+        let mut reader = BufferedSocket::new(&stream);
+
+        let mut copy_buf = Vec::new();
+        let progress = SharedProgress::new("拉取文件", "个文件", 1, 7);
+        stream_file_content(
+            &stream,
+            &file,
+            7,
+            "remote",
+            "buffered",
+            &mut reader,
+            &mut copy_buf,
+            &progress,
+        )
+        .unwrap();
+
+        drop(file);
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"7 bytes");
+        assert_eq!(progress.counts(), (1, 7));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

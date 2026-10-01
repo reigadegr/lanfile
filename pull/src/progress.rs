@@ -95,6 +95,13 @@ impl SharedProgress {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        self.inner.lock().map_or((0, 0), |progress| {
+            (progress.done_files, progress.done_bytes)
+        })
+    }
 }
 
 impl Progress {
