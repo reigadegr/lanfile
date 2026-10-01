@@ -261,10 +261,7 @@ async fn discard(local: &Path) {
 }
 
 /// 把远端路径做百分号编码：保留 `A-Za-z0-9-_.~/` 与分隔符 `/`，其余按 UTF-8 字节转义。
-/// 用于 `/files/<sub>/<name>` 与 `/api/list/<sub>` 这两类路径。
-///
-/// 转义直接查表手写两个 hex 字符，不走 `fmt::Write`：文件名带中文或空格时每个字节
-/// 都会走一次格式化分发，这条路径在每个文件下载时都会经过。
+/// 用于 `/api/manifest`、`/pull` 与 `/stream-batch` 请求路径。
 pub fn encode_path(path: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(path.len());

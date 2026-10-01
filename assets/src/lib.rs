@@ -130,8 +130,7 @@ impl ServeFiles {
     /// 有效期外先打开文件并用 fd 元数据校验缓存；命中时直接给出缓存里的 fd、
     /// 元数据以及解析好的响应头，未命中才沿用刚打开的文件。
     fn open(&self, sub: &str) -> Option<Opened> {
-        // 有效期内的快路径：连 metadata 都省掉（本机 1.03 µs，占每请求 CPU 的 3%），
-        // 连路径也不必再拼——缓存里存着上次拼好的那一份
+        // 有效期内直接复用缓存条目，不打开文件。
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(hit) = self.cache.get_fresh(sub) {
             return Some(Opened {
@@ -180,13 +179,9 @@ impl ServeFiles {
         Some((Arc::from(joined), file, metadata))
     }
 
-    /// 打开文件并取 fd 自己的元数据，然后下顺序读提示。
-    ///
-    /// `/files` 未命中缓存时与 `/pull` 全程都走这里，两条路的这一段完全一致。
+    /// 打开文件并取 fd 自己的元数据，同时确认它是普通文件。
     fn open_confirmed(&self, sub: &str, joined: &Path) -> Option<(Arc<File>, FileMeta)> {
         let file = self.open_uncached(sub, joined)?;
-        // 取这个 fd 自己的元数据：它会随缓存一起给出去，命中时就不必再 fstat 一次。
-        // 缓存里必须记 fd 的属性而不是路径的 lstat，否则文件被换掉时会串味。
         let (metadata, is_file) = fd_meta(&file).ok()?;
         if !is_file {
             return None;
@@ -218,12 +213,6 @@ impl ServeFiles {
 }
 
 /// 取已打开 fd 的元数据，并确认它是普通文件。
-///
-/// 不用 `std::fs::File::metadata()`：它在本目标上发的是 `statx(fd, AT_EMPTY_PATH)`
-/// （实测 353 ns），而 `fstat` 只要 285 ns，两者给出的 inode、长度与 mtime 完全相同。
-///
-/// `Stat` 字段的符号性随 rustix 后端而变（`linux_raw` 与 `libc` 不同），这里统一按非负的 stat
-/// 字段转换宽度，所以显式关掉这两条 cast 检查。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn fd_meta(file: &File) -> std::io::Result<(FileMeta, bool)> {
