@@ -599,8 +599,9 @@ fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSe
     let Some(dirfd) = zip::open_dir(target) else {
         return;
     };
+    let mut opener = zip::BatchFileOpener::new(dirfd);
     for rel in entries {
-        let Some((file, size)) = zip::open_file_under(&dirfd, rel) else {
+        let Some((file, size)) = opener.open_file(rel) else {
             continue;
         };
         let entry = StreamFile {

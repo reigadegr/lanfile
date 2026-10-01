@@ -7,6 +7,10 @@ use std::mem::MaybeUninit;
 use rustix::fd::OwnedFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::collections::HashMap;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::sync::Arc;
 
 /// zip 归档中的一条记录：普通文件或目录（目录条目用于保留空目录结构）。
 pub enum Entry {
@@ -26,19 +30,75 @@ pub fn open_dir(dir: &Path) -> Option<OwnedFd> {
     .ok()
 }
 
-/// 相对目标目录打开普通文件，并用 fd 自己的 fstat 大小。
+/// 批量打开目标目录内的普通文件，并缓存已验证的父目录 fd。
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn open_file_under(dirfd: &OwnedFd, rel: &str) -> Option<(File, u64)> {
-    if !is_confined_relative_path(rel) {
-        return None;
+pub struct BatchFileOpener {
+    root: Arc<OwnedFd>,
+    dirs: HashMap<String, Arc<OwnedFd>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl BatchFileOpener {
+    #[must_use]
+    pub fn new(root: OwnedFd) -> Self {
+        Self {
+            root: Arc::new(root),
+            dirs: HashMap::new(),
+        }
     }
-    let fd = rfs::openat(dirfd, rel, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).ok()?;
-    let stat = rfs::fstat(&fd).ok()?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return None;
+
+    /// 相对目标目录打开普通文件，并用 fd 自己的 fstat 大小。
+    pub fn open_file(&mut self, rel: &str) -> Option<(File, u64)> {
+        if !is_confined_relative_path(rel) {
+            return None;
+        }
+        let parent = self.open_parent(rel)?;
+        let file_name = rel.rsplit_once('/').map_or(rel, |(_, name)| name);
+        let fd = rfs::openat(
+            parent,
+            file_name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok()?;
+        let stat = rfs::fstat(&fd).ok()?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+            return None;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        Some((File::from(fd), stat.st_size as u64))
     }
-    #[allow(clippy::cast_sign_loss)]
-    Some((File::from(fd), stat.st_size as u64))
+
+    fn open_parent(&mut self, rel: &str) -> Option<Arc<OwnedFd>> {
+        let Some((parents, _)) = rel.rsplit_once('/') else {
+            return Some(Arc::clone(&self.root));
+        };
+
+        let mut current = Arc::clone(&self.root);
+        let mut prefix = String::new();
+        for component in parents.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if let Some(cached) = self.dirs.get(&prefix) {
+                current = Arc::clone(cached);
+                continue;
+            }
+
+            let child = rfs::openat(
+                &current,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .ok()?;
+            let child = Arc::new(child);
+            self.dirs.insert(prefix.clone(), Arc::clone(&child));
+            current = child;
+        }
+        Some(current)
+    }
 }
 
 /// 非 Linux/Android 平台的回退实现。
@@ -269,7 +329,33 @@ mod tests {
         std::fs::write(base.join("outside.txt"), "secret").unwrap();
 
         let dirfd = open_dir(&root).unwrap();
-        assert!(open_file_under(&dirfd, "../outside.txt").is_none());
+        let mut opener = BatchFileOpener::new(dirfd);
+        assert!(opener.open_file("../outside.txt").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn batch_opener_rejects_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let base = tmp_root("batch-symlink");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(base.join("outside.txt"), "secret").unwrap();
+        std::fs::write(nested.join("inside.txt"), "safe").unwrap();
+        symlink(base.join("outside.txt"), nested.join("final.txt")).unwrap();
+        symlink(&base, root.join("intermediate")).unwrap();
+
+        let mut opener = BatchFileOpener::new(open_dir(&root).unwrap());
+        assert!(opener.open_file("nested/inside.txt").is_some());
+        assert!(opener.open_file("nested/inside.txt").is_some());
+        assert!(opener.open_file("nested/final.txt").is_none());
+        assert!(opener.open_file("intermediate/outside.txt").is_none());
+        assert!(opener.open_file("../outside.txt").is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }
