@@ -21,6 +21,7 @@ struct Progress {
     total_bytes: u64,
     done_files: u64,
     done_bytes: u64,
+    started_at: Instant,
     last_draw: Instant,
 }
 
@@ -40,6 +41,7 @@ impl SharedProgress {
                 total_bytes,
                 done_files: 0,
                 done_bytes: 0,
+                started_at: Instant::now(),
                 last_draw: Instant::now(),
             })),
         }
@@ -84,6 +86,11 @@ impl SharedProgress {
         if let Ok(mut progress) = self.inner.lock() {
             progress.draw(true);
             if progress.enabled {
+                let _ = write!(
+                    std::io::stderr(),
+                    "，耗时 {} ms",
+                    progress.started_at.elapsed().as_millis()
+                );
                 let _ = writeln!(std::io::stderr());
             }
         }
@@ -121,7 +128,7 @@ impl Progress {
         }
         let _ = write!(
             line,
-            "] {}%/{} {}，{}/{}",
+            "] {}/{} {}，{}/{}",
             self.done_files,
             self.total_files,
             self.unit,

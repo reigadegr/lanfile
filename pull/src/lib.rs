@@ -43,6 +43,7 @@ use crate::streaming::fetch_stream_shard;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 /// 分片流固定使用 4 条连接。
@@ -148,6 +149,7 @@ fn to_not_found(error: Error, remote: &str) -> Error {
 async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<(), BoxError> {
     let target = local_target(&p.local, &p.remote, p.flat);
     eprintln!("lanfile get: 获取目录清单...");
+    let manifest_started = Instant::now();
     let entries = match fetch_manifest(pool, &p.host, &p.remote).await {
         Ok(entries) => entries,
         Err(Error::Http { status: 404, .. }) if fallback_file => {
@@ -155,6 +157,10 @@ async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<()
         }
         Err(error) => return Err(to_not_found(error, &p.remote).into()),
     };
+    eprintln!(
+        "lanfile get: 获取目录清单完成，耗时 {} ms",
+        manifest_started.elapsed().as_millis()
+    );
     let (stats, files) = prepare_manifest(&target, &entries).await?;
     let (stream_stats, failures) =
         pull_stream_shards(pool, &p.host, &p.remote, &target, files, &stats).await?;
@@ -191,6 +197,7 @@ async fn run_file(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
 
 /// 拉单个文件到 `local/<basename>`：不套层，落盘根目录按需建。
 async fn pull_file_run(pool: &Pool, p: &Parsed) -> Result<(), Error> {
+    let started = Instant::now();
     let remote = &p.remote;
     let name = basename(remote).unwrap_or("download");
     let target = p.local.join(name);
@@ -199,10 +206,11 @@ async fn pull_file_run(pool: &Pool, p: &Parsed) -> Result<(), Error> {
     }
     let fetched = fetch_file(pool, &p.host, remote, &target).await?;
     eprintln!(
-        "lanfile get: {}/{remote} -> {}（{} 字节）",
+        "lanfile get: {}/{remote} -> {}（{} 字节，耗时 {} ms）",
         p.base,
         target.display(),
-        fetched.bytes
+        fetched.bytes,
+        started.elapsed().as_millis()
     );
     let mut via = ViaCounts::default();
     via.record(fetched.via);
