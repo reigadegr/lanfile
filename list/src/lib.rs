@@ -577,13 +577,14 @@ pub fn serve_stream_batch(
     }
 }
 
-fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<HashSet<String>> {
+fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
     let invalid =
         |message: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
     if body.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(Vec::new());
     }
-    let mut entries = HashSet::new();
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
     let mut offset = 0;
     while offset < body.len() {
         let Some(nul) = body[offset..].iter().position(|&byte| byte == 0) else {
@@ -601,19 +602,16 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<HashSet<String>> {
         {
             return Err(invalid("stream-batch 路径非法"));
         }
-        if !entries.insert(path.to_owned()) {
+        if !seen.insert(path) {
             return Err(invalid("stream-batch 路径重复"));
         }
+        entries.push(path.to_owned());
         offset = path_end + 1;
     }
     Ok(entries)
 }
 
-fn send_batch_entries(
-    target: &Path,
-    entries: &HashSet<String>,
-    entry_tx: &mpsc::SyncSender<zip::Entry>,
-) {
+fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<zip::Entry>) {
     for rel in entries {
         let Some((file, size)) = zip::open_file_under(target, rel) else {
             continue;
@@ -633,7 +631,7 @@ fn serve_stream_batch_inner(
     socket: &mut TcpStream,
     root: &Path,
     sub: &str,
-    entries: &HashSet<String>,
+    entries: &[String],
 ) -> std::io::Result<()> {
     let target = resolve_under(root, sub).filter(|p| p.is_dir());
     let Some(target) = target else {
@@ -960,7 +958,7 @@ pub fn list_routes(root: PathBuf, port: u16) -> Router {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::{collections::HashSet, fs::File, io::Write as _, path::Path, time::Instant};
+    use std::{fs::File, io::Write as _, path::Path, time::Instant};
 
     use tokio::sync::mpsc;
 
@@ -978,7 +976,7 @@ mod tests {
 
         assert_eq!(
             parse_stream_batch_body(&body).unwrap(),
-            HashSet::from(["a.txt".to_owned(), "dir/b.bin".to_owned()])
+            vec!["a.txt".to_owned(), "dir/b.bin".to_owned()]
         );
     }
 
