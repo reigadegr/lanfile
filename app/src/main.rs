@@ -215,28 +215,32 @@ impl LogSink {
     ///
     /// 取出与写出都在 `writing` 下完成：写出者只有一个，顺序即取出顺序。只按
     /// `writing` -> `pending` 的顺序取锁，`push` 只碰自己的分片，不会死锁。
-    fn flush(&self, out: &mut impl io::Write) -> io::Result<bool> {
+    fn drain(&self, out: &mut impl io::Write, spare: &mut Vec<u8>) -> io::Result<bool> {
         let _writing = lock(&self.writing);
         let mut wrote = false;
         for shard in &self.pending {
-            // `mem::take` 把这一片取空，锁随即释放：下面的 `write_all` 在锁外做，
-            // 分片上的追加不会被这次可能很慢的写出堵住。
-            let batch = std::mem::take(&mut *lock(shard));
+            // 交换出的缓冲写完清空后继续给下一片用，锁随即释放：`write_all` 在锁外
+            // 做，分片上的追加不会被这次可能很慢的写出堵住，也不必每批重新分配。
+            let mut batch = std::mem::take(spare);
+            std::mem::swap(&mut batch, &mut *lock(shard));
             if !batch.is_empty() {
                 out.write_all(&batch)?;
                 wrote = true;
             }
+            batch.clear();
+            *spare = batch;
         }
         Ok(wrote)
     }
 
     /// 写线程：攒够一批会被 [`Self::push`] 的调用方叫醒，否则最多等 [`LOG_INTERVAL`]。
     fn run(&self, out: &mut impl io::Write) {
+        let mut spare = Vec::new();
         loop {
             // 先把已有的刷出去。刷到东西就接着刷（可能又有新的追加进来），刷空了才去等。
             // 这样"检查是否全空"与"等待"之间没有窗口：睡下去之前最后一次 flush 已经
             // 确认过所有分片都是空的。
-            match self.flush(out) {
+            match self.drain(out, &mut spare) {
                 Ok(true) => continue,
                 Ok(false) => {}
                 // stdout 已经写不动了（管道对端消失之类），再试也没有意义
@@ -304,7 +308,7 @@ async fn main() {
     let root = std::fs::canonicalize(&dir).unwrap_or_else(|error| {
         tracing::error!("无法访问目录 {:?}: {error}", dir);
         // 进程马上退出，这一行不能留在缓冲里
-        let _ = SINK.flush(&mut std::io::stdout());
+        let _ = io::Write::flush(&mut &SINK);
         std::process::exit(1);
     });
 
@@ -325,7 +329,7 @@ async fn main() {
         std::process::exit(1);
     }
     // 退出前把最后一批日志写出去
-    let _ = SINK.flush(&mut std::io::stdout());
+    let _ = io::Write::flush(&mut &SINK);
 }
 
 /// 访问日志的出口。
@@ -463,7 +467,8 @@ mod tests {
 
         // 没攒够一批，所以一行都还没写出去；内容与顺序原样留着
         let mut out = Vec::new();
-        let wrote = sink.flush(&mut out).unwrap();
+        let mut spare = Vec::new();
+        let wrote = sink.drain(&mut out, &mut spare).unwrap();
         assert!(wrote, "有积压时 flush 必须报告写过东西");
         assert_eq!(out.as_slice(), b"one\ntwo\n");
     }
@@ -472,8 +477,9 @@ mod tests {
     fn flush_reports_when_every_shard_is_empty() {
         let sink = LogSink::new();
         let mut out = Vec::new();
+        let mut spare = Vec::new();
         assert!(
-            !sink.flush(&mut out).unwrap(),
+            !sink.drain(&mut out, &mut spare).unwrap(),
             "全空时 flush 必须报告没东西可写"
         );
         assert!(out.is_empty());
@@ -496,8 +502,9 @@ mod tests {
         sink.append(0, &batch);
 
         let mut out = Vec::new();
-        sink.flush(&mut out).unwrap();
-        sink.flush(&mut out).unwrap();
+        let mut spare = Vec::new();
+        sink.drain(&mut out, &mut spare).unwrap();
+        sink.drain(&mut out, &mut spare).unwrap();
         assert_eq!(out.len(), LOG_BATCH);
     }
 
@@ -509,7 +516,8 @@ mod tests {
         assert!(!sink.append(0, b"dropped\n"));
 
         let mut out = Vec::new();
-        sink.flush(&mut out).unwrap();
+        let mut spare = Vec::new();
+        sink.drain(&mut out, &mut spare).unwrap();
         assert_eq!(out, full);
     }
 
