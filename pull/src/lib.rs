@@ -48,6 +48,8 @@ const STREAM_SHARDS: u32 = 4;
 /// 单个目录亲和任务的最大文件数或字节数，超过后拆成连续小任务。
 const STREAM_TASK_MAX_FILES: usize = 512;
 const STREAM_TASK_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// 清单分片流读短或尺寸变化后，单个文件改走 `/pull` 的最大重试次数。
+const FILE_RETRIES: usize = 3;
 
 /// 子命令入口：`lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]`。
 ///
@@ -150,7 +152,8 @@ async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<()
         Err(error) => return Err(to_not_found(error, &p.remote).into()),
     };
     let (stats, files) = prepare_manifest(&target, &entries).await?;
-    let stream_stats = pull_stream_shards(&p.host, &p.remote, &target, files).await?;
+    let (stream_stats, failures) =
+        pull_stream_shards(pool, &p.host, &p.remote, &target, files).await?;
     let via = ViaCounts::from_stream(&stream_stats);
     eprintln!(
         "lanfile get: {}/{} -> {}（清单分片流：{} 文件，{} 目录，{} 字节，跳过已存在 {} 个）",
@@ -163,6 +166,15 @@ async fn run_manifest(pool: &Pool, p: &Parsed, fallback_file: bool) -> Result<()
         stats.skipped,
     );
     via.report();
+    eprintln!(
+        "lanfile get: 拉取完成：成功 {} 个（含已存在跳过 {} 个），失败 {} 个",
+        stats.skipped + stream_stats.files,
+        stats.skipped,
+        failures.len()
+    );
+    for path in failures {
+        eprintln!("lanfile get: {path} 因为重试次数达到上限无法拉取");
+    }
     Ok(())
 }
 
@@ -245,11 +257,12 @@ async fn prepare_manifest(
 
 /// 4 个 shard 并发接收；每个任务持有 manifest 中自己的文件集合并做精确校验。
 async fn pull_stream_shards(
+    pool: &Pool,
     host: &str,
     remote: &str,
     local: &Path,
     mut files: HashMap<String, u64>,
-) -> Result<crate::streaming::StreamStats, Error> {
+) -> Result<(crate::streaming::StreamStats, Vec<String>), Error> {
     let shards = build_shard_tasks(&mut files);
 
     let mut tasks = Vec::with_capacity(STREAM_SHARDS as usize);
@@ -261,10 +274,64 @@ async fn pull_stream_shards(
     }
     let results = futures_util::future::try_join_all(tasks).await?;
     let mut stats = crate::streaming::StreamStats::default();
+    let mut retry_files = std::collections::BTreeSet::new();
     for result in results {
-        stats.merge(&result);
+        stats.merge(&result.stats);
+        retry_files.extend(result.retry_files);
     }
-    Ok(stats)
+    let failures = retry_failed_files(
+        pool,
+        host,
+        remote,
+        local,
+        retry_files.into_iter().collect(),
+        &mut stats,
+    )
+    .await;
+    Ok((stats, failures))
+}
+
+/// Retry stream failures one file at a time, returning files that still failed.
+async fn retry_failed_files(
+    pool: &Pool,
+    host: &str,
+    remote: &str,
+    local: &Path,
+    files: Vec<String>,
+    stats: &mut crate::streaming::StreamStats,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for rel in files {
+        let mut last_error = None;
+        let remote_path = if remote.is_empty() {
+            rel.clone()
+        } else {
+            format!("{remote}/{rel}")
+        };
+        for attempt in 1..=FILE_RETRIES {
+            match fetch_file(pool, host, &remote_path, &local.join(&rel)).await {
+                Ok(fetched) => {
+                    stats.files += 1;
+                    stats.bytes += fetched.bytes;
+                    match fetched.via {
+                        Via::Splice => stats.spliced += 1,
+                        Via::Copy => stats.copied += 1,
+                        Via::Prebuffered => stats.prebuffered += 1,
+                    }
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("lanfile get: {rel} 第 {attempt}/{FILE_RETRIES} 次重试失败：{error}");
+                    last_error = Some(error);
+                }
+            }
+        }
+        if last_error.is_some() {
+            failures.push(rel);
+        }
+    }
+    failures
 }
 
 struct ShardTask {
@@ -425,6 +492,44 @@ mod tests {
         assert_eq!(count, 32);
         assert_eq!(loads, [80, 80, 80, 80]);
         assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_failed_files_gives_up_after_three_attempts() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..FILE_RETRIES {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = conn.read(&mut request).await;
+                conn.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let local =
+            std::env::temp_dir().join(format!("lanfile-retry-failed-{}", std::process::id()));
+        let mut stats = crate::streaming::StreamStats::default();
+        let failures = retry_failed_files(
+            &Pool::default(),
+            &addr.to_string(),
+            "sub",
+            &local,
+            vec!["bad.txt".to_string()],
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(failures, ["bad.txt"]);
+        assert_eq!(stats.files, 0);
+        assert!(!local.join("bad.txt").exists());
+        server.await.unwrap();
     }
 
     /// 基准：`memrchr` 找末段 vs `trim_matches` + `rsplit`

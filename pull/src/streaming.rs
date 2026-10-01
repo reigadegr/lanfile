@@ -44,6 +44,12 @@ pub struct StreamStats {
     pub prebuffered: u64,
 }
 
+/// One shard's result, including files that need the single-file retry path.
+pub struct StreamOutcome {
+    pub stats: StreamStats,
+    pub retry_files: Vec<String>,
+}
+
 impl StreamStats {
     pub const fn merge(&mut self, other: &Self) {
         self.files += other.files;
@@ -54,12 +60,20 @@ impl StreamStats {
     }
 }
 
+impl StreamOutcome {
+    fn queue_retry(&mut self, rel: &str, expected: &mut HashMap<String, u64>) {
+        self.retry_files.push(rel.to_string());
+        self.retry_files
+            .extend(expected.drain().map(|(path, _)| path));
+    }
+}
+
 pub async fn fetch_stream_shard(
     host: &str,
     remote: &str,
     target: &Path,
     entries: Vec<(String, u64)>,
-) -> Result<StreamStats, Error> {
+) -> Result<StreamOutcome, Error> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(host))
         .await
         .map_err(|_| Error::Timeout { phase: "连接" })?
@@ -104,17 +118,13 @@ fn fetch_stream_blocking(
     remote: &str,
     target: &Path,
     mut expected: HashMap<String, u64>,
-) -> Result<StreamStats, Error> {
+) -> Result<StreamOutcome, Error> {
     // tokio 的 socket 是非阻塞的，切回阻塞模式才能用同步 IO
     stream.set_nonblocking(false)?;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
-    let request = format!(
-        "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        request_body.len()
-    );
-    write_all_vectored(&mut stream, request.as_bytes(), request_body)?;
+    write_stream_request(&mut stream, host, request_path, request_body)?;
 
     let mut reader = BufferedSocket::new(&stream);
     let status = reader.read_response_head()?;
@@ -126,9 +136,12 @@ fn fetch_stream_blocking(
     }
 
     std::fs::create_dir_all(target)?;
-    let mut stats = StreamStats::default();
     let mut path_buf = Vec::with_capacity(256);
     let mut copy_buf = Vec::new();
+    let mut outcome = StreamOutcome {
+        stats: StreamStats::default(),
+        retry_files: Vec::new(),
+    };
 
     loop {
         // 1 字节类型；干净 EOF 视作收尾
@@ -159,7 +172,22 @@ fn fetch_stream_blocking(
                 let mut size_buf = [0_u8; 8];
                 reader.read_exact(&mut size_buf)?;
                 let size = u64::from_le_bytes(size_buf);
-                check_expected(&mut expected, rel, size)?;
+                let Some(&want) = expected.get(rel) else {
+                    return Err(unexpected_stream_path(rel));
+                };
+                if size != want {
+                    eprintln!(
+                        "lanfile get: {rel} 清单大小为 {want} 字节，分片流为 {size} 字节，稍后重试"
+                    );
+                    expected.remove(rel);
+                    if !discard_file_content(&stream, size, &mut reader, &mut copy_buf)? {
+                        outcome.queue_retry(rel, &mut expected);
+                        break;
+                    }
+                    outcome.retry_files.push(rel.to_string());
+                    continue;
+                }
+                expected.remove(rel);
                 let file_path = target.join(rel);
                 let file = File::create(&file_path)?;
                 match stream_file_content(
@@ -173,16 +201,21 @@ fn fetch_stream_blocking(
                 ) {
                     Ok(via) => {
                         match via {
-                            Via::Splice => stats.spliced += 1,
-                            Via::Copy => stats.copied += 1,
-                            Via::Prebuffered => stats.prebuffered += 1,
+                            Via::Splice => outcome.stats.spliced += 1,
+                            Via::Copy => outcome.stats.copied += 1,
+                            Via::Prebuffered => outcome.stats.prebuffered += 1,
                         }
-                        stats.files += 1;
-                        stats.bytes += size;
+                        outcome.stats.files += 1;
+                        outcome.stats.bytes += size;
                     }
                     Err(error) => {
                         drop(file);
                         let _ = std::fs::remove_file(&file_path);
+                        if matches!(error, Error::Truncated { .. }) {
+                            eprintln!("lanfile get: {rel} 分片流读取不完整，稍后重试：{error}");
+                            outcome.queue_retry(rel, &mut expected);
+                            break;
+                        }
                         return Err(error);
                     }
                 }
@@ -190,8 +223,34 @@ fn fetch_stream_blocking(
             _ => return Err(Error::Malformed("远端返回了未知的条目类型")),
         }
     }
-    check_missing(&expected)?;
-    Ok(stats)
+    outcome
+        .retry_files
+        .extend(expected.drain().map(|(path, _)| path));
+    Ok(outcome)
+}
+
+fn write_stream_request(
+    stream: &mut TcpStream,
+    host: &str,
+    request_path: &str,
+    request_body: &[u8],
+) -> Result<(), Error> {
+    let request = format!(
+        "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request_body.len()
+    );
+    Ok(write_all_vectored(
+        stream,
+        request.as_bytes(),
+        request_body,
+    )?)
+}
+
+fn unexpected_stream_path(rel: &str) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("分片流包含清单外的路径：{rel}"),
+    ))
 }
 
 /// Writes both request parts without copying them into one contiguous buffer.
@@ -214,36 +273,6 @@ fn write_all_vectored(stream: &mut TcpStream, head: &[u8], body: &[u8]) -> io::R
         stream.write_all(&body[body_start..])?;
     }
     Ok(())
-}
-
-fn check_expected(expected: &mut HashMap<String, u64>, rel: &str, size: u64) -> Result<(), Error> {
-    let want = expected.remove(rel).ok_or_else(|| {
-        Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("分片流包含清单外的路径：{rel}"),
-        ))
-    })?;
-    if size != want {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("分片流文件大小与清单不一致：{rel} 应得 {want} 字节，收到 {size} 字节"),
-        )));
-    }
-    Ok(())
-}
-
-fn check_missing(expected: &HashMap<String, u64>) -> Result<(), Error> {
-    if expected.is_empty() {
-        return Ok(());
-    }
-    Err(Error::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!(
-            "分片流缺少清单中的 {} 个文件，首个为 {}",
-            expected.len(),
-            expected.keys().next().map_or("", String::as_str)
-        ),
-    )))
 }
 
 /// 把下一段 `size` 字节从 socket 搬进文件。
@@ -307,6 +336,31 @@ fn stream_file_content(
         remaining -= n as u64;
     }
     Ok(Via::Copy)
+}
+
+/// Discard a record whose size disagrees with the manifest, keeping the rest
+/// of the stream decodable on the same connection.
+fn discard_file_content(
+    mut socket: &TcpStream,
+    size: u64,
+    reader: &mut BufferedSocket<'_>,
+    copy_buf: &mut Vec<u8>,
+) -> Result<bool, Error> {
+    let from_buf = reader.available().min(size as usize);
+    reader.discard(from_buf);
+    let mut remaining = size - from_buf as u64;
+    if copy_buf.len() != STREAM_READ_BUF {
+        copy_buf.resize(STREAM_READ_BUF, 0);
+    }
+    while remaining > 0 {
+        let want = remaining.min(copy_buf.len() as u64) as usize;
+        let read = socket.read(&mut copy_buf[..want])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        remaining -= read as u64;
+    }
+    Ok(true)
 }
 
 /// 带用户态缓冲的 socket 读取器。
@@ -424,6 +478,10 @@ impl<'a> BufferedSocket<'a> {
         self.start += take;
         Ok(take)
     }
+
+    fn discard(&mut self, n: usize) {
+        self.start += self.available().min(n);
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +489,52 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_size_mismatch_is_retried_and_other_files_continue() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = conn.read(&mut request).await;
+            let mut body = vec![1_u8];
+            body.extend_from_slice(b"a.txt\0");
+            body.extend_from_slice(&2_u64.to_le_bytes());
+            body.extend_from_slice(b"xx");
+            body.push(1);
+            body.extend_from_slice(b"b.txt\0");
+            body.extend_from_slice(&3_u64.to_le_bytes());
+            body.extend_from_slice(b"yyy");
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+            conn.write_all(response.as_bytes()).await.unwrap();
+            conn.write_all(&body).await.unwrap();
+        });
+
+        let target =
+            std::env::temp_dir().join(format!("lanfile-stream-mismatch-{}", std::process::id()));
+        std::fs::create_dir_all(&target).unwrap();
+        let outcome = fetch_stream_shard(
+            &addr.to_string(),
+            "sub",
+            &target,
+            vec![("a.txt".to_string(), 3), ("b.txt".to_string(), 3)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.retry_files, ["a.txt"]);
+        assert_eq!(outcome.stats.files, 1);
+        assert!(matches!(
+            std::fs::read(target.join("a.txt")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"yyy");
+        server.await.unwrap();
+        std::fs::remove_dir_all(target).unwrap();
+    }
 
     #[test]
     fn stream_file_content_rejects_partial_body() {
