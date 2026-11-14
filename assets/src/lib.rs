@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use lanfile_namedfile::{FileMeta, NamedFile};
-use lanfile_sendfile::{SendfileSlot, upgrade_response};
+use lanfile_sendfile::{SendfileSlot, should_upgrade, upgrade_response};
 use mime::Mime;
 use rust_embed::RustEmbed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, Advice, FileType};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use salvo::http::header::CONTENT_DISPOSITION;
-use salvo::http::header::LAST_MODIFIED;
+use salvo::http::header::{LAST_MODIFIED, RANGE};
 use salvo::{
     http::{HeaderValue, Method, headers::ETag},
     prelude::*,
@@ -77,8 +77,9 @@ fn encoded_last_modified(res: &Response) -> Option<HeaderValue> {
 
 /// 把已经构造好的 [`NamedFile`] 写进响应，需要时升级成 sendfile 零拷贝体。
 ///
-/// `HEAD` 与「本平台确实有 sendfile」这两种情况都只写响应头，正文交给 [`upgrade_response`]
-/// 换成零拷贝体；只有没有 sendfile 可用的平台才让 [`NamedFile`] 自己把正文写出来。
+/// `HEAD` 与「这个请求适合零拷贝」两种情况都只写响应头，正文交给 [`upgrade_response`]
+/// 换成零拷贝体。其余情况必须让 [`NamedFile`] 自己用 `pread` 写出正文：带 `Range` 起点的
+/// 续传、以及零拷贝被关闭时（FUSE 根目录等）都走这里，否则响应会只剩一个空的 body。
 /// `file` 只在真的要升级时才克隆：`/files` 缓存未命中时还需要它去插缓存，所以按引用进来。
 async fn send_named_file(
     named_file: NamedFile,
@@ -88,12 +89,15 @@ async fn send_named_file(
     file: &Arc<File>,
 ) {
     let head_only = req.method() == Method::HEAD;
-    if head_only || cfg!(any(target_os = "linux", target_os = "android")) {
+    // Range 请求一律走用户态正文：sendfile 以大偏移起步在部分文件系统上会卡在内核里，
+    // 而续传的起点恰好就是上次断掉的偏移，重试会原地打转。
+    let zero_copy = !head_only && should_upgrade(req.headers().contains_key(RANGE));
+    if head_only || zero_copy {
         named_file.send_head(req.headers(), res).await;
     } else {
         named_file.send(req.headers(), res).await;
     }
-    if !head_only {
+    if zero_copy {
         upgrade_response(slot, res, Arc::clone(file));
     }
 }

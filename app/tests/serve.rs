@@ -455,13 +455,12 @@ async fn files_cache_hit_sends_the_same_headers() {
 
 /// 9 MiB of non-zero, non-repeating bytes.
 ///
-/// A placeholder leak would surface as zeros, and a mis-ordered or duplicated
-/// range would surface as a byte mismatch, so an exact comparison proves the
-/// response really came from `sendfile(2)`.
+/// Exact comparison catches placeholder leaks (zeros), mis-ordered or duplicated
+/// ranges, and wrong offsets on either the zero-copy or the `pread` body path.
 ///
-/// The size has to exceed the placeholder buffer's frame length (4 MiB) so the
-/// body spans several frames: that is what exercises the stream's cross-frame
-/// offset and remaining-length accounting. Raise it whenever that buffer grows.
+/// The size has to exceed the 4 MiB frame length so the zero-copy body spans
+/// several frames: that is what exercises cross-frame offset and remaining-length
+/// accounting. Raise it whenever that buffer grows.
 fn sendfile_payload() -> Vec<u8> {
     (0..9 * 1024 * 1024_u32)
         .map(|index| (index % 251) as u8 + 1)
@@ -610,14 +609,14 @@ async fn small_response_body_is_not_held_by_nagle() {
 }
 
 #[tokio::test]
-async fn range_request_over_sendfile_returns_the_exact_slice() {
+async fn range_request_returns_the_exact_slice_from_user_space_body() {
     let dir = TestDir::new();
     let payload = sendfile_payload();
     std::fs::write(dir.root().join("big.bin"), &payload).unwrap();
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    // 6 MiB wide, so the slice crosses a 4 MiB placeholder frame boundary and the
-    // stream's offset arithmetic is exercised across frames rather than within one.
+    // Range 响应故意不走 sendfile：起点是大偏移时它在 FUSE 上会卡在内核里。
+    // 6 MiB 宽，跨过 ChunkedFile 的多个分块，验证 pread 的偏移推进与剩余长度。
     let (start, end) = (1_000_000_usize, 7_000_000_usize);
     let (head, body) = download(
         addr,
@@ -629,6 +628,39 @@ async fn range_request_over_sendfile_returns_the_exact_slice() {
 
     assert!(head.starts_with("HTTP/1.1 206"), "head: {head}");
     assert_eq!(body, payload[start..end].to_vec());
+}
+
+/// 续传起点落在 1 GiB 以上时，正文仍要由 `pread` 流式体从正确位置读出。
+/// 稀疏文件不占实际空间，只在断点附近写一小段，就复现了 4.9G 镜像的续传形状：
+/// 这里正是实测中「206 之后一个字节都发不出来」的那个偏移。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn large_offset_resume_serves_the_target_bytes() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = TestDir::new();
+    let path = dir.root().join("system.img");
+    let total = 5_286_416_384_u64;
+    let offset = 1_941_269_872_u64;
+    let marker = b"RESUME-FROM-1941269872";
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.set_len(total).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(marker).unwrap();
+    drop(file);
+
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+    let (head, body) = download(
+        addr,
+        "system.img",
+        &format!("Range: bytes={offset}-{}\r\n", offset + 4095),
+    )
+    .await;
+    server.abort();
+
+    assert!(head.starts_with("HTTP/1.1 206"), "head: {head}");
+    assert_eq!(body.len(), 4096);
+    assert_eq!(&body[..marker.len()], &marker[..]);
 }
 
 #[tokio::test]

@@ -804,6 +804,11 @@ fn sendfile_all(
     size: u64,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
+    // 与 /files、/pull 共用同一个开关：FUSE 根目录上 sendfile 可能既不返回也不推进，
+    // 那时候连 errno 回退都等不到，只能从一开始就别调这个系统调用。
+    if !lanfile_sendfile::enabled() {
+        return copy_user(socket, file, 0, size, buf);
+    }
     let mut offset = 0_u64;
     let mut remaining = size;
     while remaining > 0 {

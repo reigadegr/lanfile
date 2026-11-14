@@ -15,8 +15,14 @@
 //! this project's fast path does.
 //!
 //! Framing is untouched: the placeholder byte count equals the `Content-Length`
-//! Hyper was given, so keep-alive, range responses and Hyper's own accounting
-//! behave exactly as they do for an ordinary body.
+//! Hyper was given, so keep-alive and Hyper's own accounting behave exactly as
+//! they do for an ordinary body.
+//!
+//! [`should_upgrade`] decides whether this path is used at all: range responses
+//! and FUSE roots keep `NamedFile`'s `pread` body instead. `sendfile(2)` can
+//! stall in the kernel when started at a large offset on such filesystems, and
+//! a resumed download's offset is always the byte where the previous attempt
+//! broke off — retrying through that path would loop forever.
 
 use std::fs::File;
 use std::sync::Arc;
@@ -31,16 +37,18 @@ use salvo::{
 };
 
 mod body;
+mod policy;
 mod stream;
 
 pub use body::SendfileSlot;
+pub use policy::{configure, enabled, should_upgrade};
 pub use stream::SendfileStream;
 
 /// Replaces a file response body with a zero-copy `sendfile(2)` body.
 ///
-/// Call this after the response headers and body have been produced, passing the
-/// file that was opened for the same response. The response is left untouched
-/// unless every condition holds:
+/// Call this only when [`should_upgrade`] returned `true`: that decision decides
+/// whether the caller wrote a body at all, so it must not be re-decided here.
+/// The response is left untouched unless every condition holds:
 ///
 /// - the status is `200 OK` or `206 Partial Content`;
 /// - `Content-Length` is present and non-zero;
@@ -59,6 +67,8 @@ pub fn upgrade_response(slot: &SendfileSlot, res: &mut Response, file: Arc<File>
     let Some(len) = header_u64(res, CONTENT_LENGTH) else {
         return;
     };
+    // 正常路径不会有 Content-Range（带 Range 的请求已在 should_upgrade 处分流）。
+    // 仍按头解析：这是 pub API，被直接用于 206 响应时不能从错误的位置开始发。
     let offset = header_str(res, CONTENT_RANGE)
         .and_then(range_start)
         .unwrap_or(0);

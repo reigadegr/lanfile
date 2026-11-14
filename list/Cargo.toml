@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 salvo = { workspace = true, features = ["server"] }
+lanfile-sendfile = { path = "../sendfile" }
 chrono = { workspace = true }
 serde = { version = "1.0.229", features = ["derive"] }
 if-addrs = "0.15"

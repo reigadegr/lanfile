@@ -177,7 +177,17 @@ fn transfer(target: &impl SendfileTarget, plan: &mut Plan, len: usize) -> io::Re
                 done += written;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-            Err(error) => return Err(error),
+            Err(error) => {
+                // 文件系统或内核不支持 sendfile：当前连接按原方式结束，之后的请求
+                // 由 should_upgrade 分流到用户态正文，不会反复卡进同一个系统调用。
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                ) {
+                    crate::policy::disable();
+                }
+                return Err(error);
+            }
         }
     }
     Ok(done)

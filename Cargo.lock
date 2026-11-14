@@ -917,6 +917,7 @@ dependencies = [
  "chrono",
  "futures-lite",
  "if-addrs",
+ "lanfile-sendfile",
  "rustix 1.1.5 (git+https://github.com/reigadegr/rustix)",
  "salvo",
  "serde",

@@ -312,6 +312,10 @@ async fn main() {
         std::process::exit(1);
     });
 
+    if let Some(reason) = lanfile_sendfile::configure(&root) {
+        tracing::warn!("sendfile 已关闭（{reason}）：文件正文改用 pread 发送");
+    }
+
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("serving {} on http://{addr}", root.display());
     let access_log = Arc::new(access_log(is_terminal));

@@ -123,13 +123,19 @@ sh debug.sh
 
 - `mimalloc` 做全局分配。
 - `/files`、`/pull` 走自写的 hyper 快路径，绕过 salvo 每请求的路由匹配与 future 装箱。
-- `/pull` 用 `sendfile(2)` 零拷贝，文件内容不进用户态。
+- `/files`、`/pull` 的整文件响应用 `sendfile(2)` 零拷贝，文件内容不进用户态；带 `Range`
+  起点的续传以及 FUSE 根目录改用 `pread` 流式体（见「已知限制」）。
 - 访问日志分片（每线程一片）+ 批量攒 64KiB 再写 + 粗时钟（`CLOCK_REALTIME_COARSE`）打时间
   戳，每请求不再各分配一行。
 - 目录打包 zip 流式产出，配合 `fadvise(SEQUENTIAL)` 预读。
 
 ## 已知限制
 
+- 共享目录挂在 FUSE 上（如 Android `/sdcard` 的 scoped-storage FUSE 层）时会自动关闭
+  `sendfile`：`sendfile(2)` 以某些大偏移起步可能卡在内核里，既不返回也不推进，表现为
+  大文件下到一半断连、之后每次续传都原地打转。带 `Range` 起点的响应一律走用户态
+  `pread`，与文件系统无关。若自动探测没覆盖到，可用 `LANFILE_NO_SENDFILE=1` 手动关闭，
+  代价是文件正文多一次用户态拷贝。
 - 只支持 HTTP，没有 TLS / 代理 / 鉴权 / cookie。
 - 服务端走 salvo 的 `HttpBuilder`，后者未暴露 `half_close`：任何在请求发完就 half-close 写
   半边的客户端（如 `nc -N`）可能收到被截断的响应。标准客户端（curl、浏览器、本项目的
