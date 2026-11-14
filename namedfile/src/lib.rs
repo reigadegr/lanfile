@@ -183,7 +183,7 @@ impl FileMeta {
 /// `NamedFile` wraps a file handle with HTTP-specific functionality including:
 ///
 /// - Automatic MIME type detection based on file extension
-/// - ETag generation for caching
+/// - `ETag` generation for caching
 /// - Last-Modified header support
 /// - Content-Disposition header for downloads
 /// - HTTP Range request support for partial content
@@ -218,7 +218,7 @@ pub struct NamedFile {
     flags: BitFlags<Flag>,
     content_type: Arc<Mime>,
     content_disposition: Option<HeaderValue>,
-    /// Pre-read content for small files, avoiding ChunkedFile + spawn_blocking overhead.
+    /// Pre-read content for small files, avoiding `ChunkedFile` + `spawn_blocking` overhead.
     preread: Option<Bytes>,
     /// 调用方已经算好的 `ETag`：命中缓存时由 [`NamedFile::set_etag`] 给出，
     /// 这样每请求就不必再 `format!` 一次再解析回来。
@@ -257,12 +257,12 @@ impl NamedFileBuilder {
     /// preloading for non-empty files.
     #[inline]
     #[must_use]
-    pub fn preload_threshold(mut self, threshold: u64) -> Self {
+    pub const fn preload_threshold(mut self, threshold: u64) -> Self {
         self.preload_threshold = Some(threshold);
         self
     }
 
-    /// Specifies whether to use ETag or not.
+    /// Specifies whether to use `ETag` or not.
     ///
     /// Default is true.
     #[inline]
@@ -328,8 +328,7 @@ impl NamedFileBuilder {
             .or_else(|| mime_infer::from_path(&path).first().map(Arc::new));
         let needs_charset = inferred_mime
             .as_ref()
-            .map(|m| is_charset_required_mime(m) && m.get_param("charset").is_none())
-            .unwrap_or(false);
+            .is_some_and(|m| is_charset_required_mime(m) && m.get_param("charset").is_none());
         let needs_detect = content_type.is_none() && path.extension().is_none();
 
         let needs_detection_sample = needs_charset || needs_detect;
@@ -504,9 +503,7 @@ fn build_content_disposition(
     let content_disposition = if disposition_type == "attachment" {
         let attached_name = file_path
             .as_ref()
-            .file_name()
-            .map(|file_name| file_name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".into());
+            .file_name().map_or_else(|| "file".into(), |file_name| file_name.to_string_lossy().into_owned());
         let quoted_filename = escape_quoted_filename(&attached_name);
         if quoted_filename == attached_name {
             format!(r#"attachment; filename="{quoted_filename}""#)
@@ -548,6 +545,7 @@ impl NamedFile {
     ///
     /// 路径来自缓存的 `Arc<Path>` 时用它：命中路径上不必再拷贝一次路径。
     #[inline]
+    #[must_use]
     pub fn builder_shared(path: Arc<Path>) -> NamedFileBuilder {
         NamedFileBuilder {
             path,
@@ -586,7 +584,7 @@ impl NamedFile {
         self.flags.remove(Flag::ContentDisposition);
     }
 
-    /// Get ETag value.
+    /// Get `ETag` value.
     pub fn etag(&self) -> Option<ETag> {
         // This etag format is similar to Apache's.
         self.modified.as_ref().and_then(|mtime| {
@@ -639,7 +637,7 @@ impl NamedFile {
 
     /// Get last modified value.
     #[inline]
-    fn last_modified(&self) -> Option<SystemTime> {
+    const fn last_modified(&self) -> Option<SystemTime> {
         self.modified
     }
 
@@ -759,11 +757,10 @@ impl NamedFile {
             res.headers_mut()
                 .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         }
-        if let Some(lm) = last_modified.and_then(|lm| self.encodable_last_modified(lm)) {
-            if !res.headers().contains_key(LAST_MODIFIED) {
+        if let Some(lm) = last_modified.and_then(|lm| self.encodable_last_modified(lm))
+            && !res.headers().contains_key(LAST_MODIFIED) {
                 res.headers_mut().typed_insert(LastModified::from(lm));
             }
-        }
         if let Some(etag) = etag {
             res.headers_mut().typed_insert(etag);
         }
@@ -1214,7 +1211,7 @@ mod tests {
 
         let mut named = build(file.path()).await;
         named.modified =
-            Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_nanos(500_000_000));
+            Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500));
         named.flags.remove(Flag::Etag);
 
         let mut headers = HeaderMap::new();
@@ -1242,7 +1239,7 @@ mod tests {
 
         let mut named = build(file.path()).await;
         named.modified =
-            Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_nanos(500_000_000));
+            Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500));
         named.flags.remove(Flag::Etag);
 
         let mut headers = HeaderMap::new();

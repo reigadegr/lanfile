@@ -486,7 +486,7 @@ mod tests {
             !sink.drain(&mut out, &mut spare).unwrap(),
             "全空时 flush 必须报告没东西可写"
         );
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]

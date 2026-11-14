@@ -58,7 +58,7 @@ pub struct ChunkedFile {
 
 impl ChunkedFile {
     /// Creates a reader for `total_size` bytes starting at `offset`.
-    pub(crate) fn new(file: Arc<File>, offset: u64, total_size: u64, buffer_size: u64) -> Self {
+    pub(crate) const fn new(file: Arc<File>, offset: u64, total_size: u64, buffer_size: u64) -> Self {
         Self {
             total_size,
             read_size: 0,

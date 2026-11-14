@@ -1210,7 +1210,7 @@ async fn stream_batch_accepts_empty_index_request() {
 
     let (head, body) = http_request(addr, "GET", "/stream-batch/", "").await;
     assert!(status_line(&head).contains("200"));
-    assert!(body.is_empty());
+    assert_eq!(body, [] as [u8; 0]);
 
     server.abort();
 }
