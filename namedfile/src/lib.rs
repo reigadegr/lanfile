@@ -361,8 +361,7 @@ impl NamedFileBuilder {
             }
         }
         let info = (|| -> std::io::Result<FileInfo> {
-            // 调用方可能已经打开过这个文件（例如用 openat2 解析过路径），那就直接用它，
-            // 不要再按路径打开一次。
+            // 调用方可能已经打开过这个文件，那就直接用它，不要再按路径打开一次。
             let file = match file {
                 Some(file) => file,
                 None => Arc::new(File::open(&path)?),

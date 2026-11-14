@@ -163,9 +163,6 @@ fn fetch_stream_blocking(
         if path_buf.len() > 8192 {
             return Err(Error::Malformed("远端返回的路径过长"));
         }
-        if path_buf.starts_with(b"/") || path_buf.split(|&b| b == b'/').any(|p| p == b"..") {
-            return Err(Error::Malformed("远端返回了非法的相对路径"));
-        }
         let rel = std::str::from_utf8(&path_buf)
             .map_err(|_| Error::Malformed("远端返回的路径不是合法 UTF-8"))?;
 

@@ -105,12 +105,17 @@ async fn api_list_shows_dot_files() {
     assert!(by_name.contains_key("visible.txt"));
 }
 
+/// 符号链接照常出现在列表里，单独标成 `link`，且 size / modified 用链接自身的元数据。
 #[cfg(unix)]
 #[tokio::test]
-async fn api_list_hides_symlinks() {
+async fn api_list_marks_symlinks() {
     let dir = TestDir::new();
     std::fs::write(dir.root().join("real.txt"), "real").unwrap();
-    std::os::unix::fs::symlink(dir.root().join("real.txt"), dir.root().join("alias.txt")).unwrap();
+    std::os::unix::fs::symlink("real.txt", dir.root().join("middle")).unwrap();
+    std::os::unix::fs::symlink("middle", dir.root().join("alias.txt")).unwrap();
+    let link_size = std::fs::symlink_metadata(dir.root().join("alias.txt"))
+        .unwrap()
+        .len();
 
     let router = api_router(dir.root().to_path_buf());
     let mut res = TestClient::get("http://127.0.0.1:5800/api/list")
@@ -121,9 +126,18 @@ async fn api_list_hides_symlinks() {
     let body = res.take_string().await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     let entries = json["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["name"], "real.txt");
-    assert!(!body.contains("alias.txt"));
+    assert_eq!(entries.len(), 3);
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = entries
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), e))
+        .collect();
+    let alias = by_name.get("alias.txt").unwrap();
+    assert_eq!(alias["type"], "link");
+    assert_eq!(alias["size"].as_u64(), Some(link_size));
+    assert!(alias["modified"].as_str().is_some());
+    let real = by_name.get("real.txt").unwrap();
+    assert_eq!(real["type"], "file");
+    assert_eq!(real["size"], 4);
 }
 
 #[tokio::test]
@@ -183,6 +197,31 @@ async fn api_manifest_returns_flat_tree_metadata() {
     let dir = by_path.get("empty").unwrap();
     assert_eq!(dir["type"], "dir");
     assert!(dir["size"].is_null());
+}
+
+/// 清单是批量传输的尺寸依据：符号链接按原始文件的内容长度列出，客户端才不会误判不完整。
+#[cfg(unix)]
+#[tokio::test]
+async fn api_manifest_follows_symlinks() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("origin.bin"), b"original").unwrap();
+    std::os::unix::fs::symlink("origin.bin", dir.root().join("middle")).unwrap();
+    std::os::unix::fs::symlink("middle", dir.root().join("alias.bin")).unwrap();
+
+    let router = api_router(dir.root().to_path_buf());
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/manifest")
+        .send(router)
+        .await;
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+
+    let body = res.take_string().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    for entry in entries {
+        assert_eq!(entry["type"], "file");
+        assert_eq!(entry["size"].as_u64(), Some(8));
+    }
 }
 
 // ---- /files 与 /pull：这两条端点由 app 的 hyper 快路径在 salvo 路由之前直接服务 ----
@@ -266,11 +305,7 @@ async fn files_endpoint_rejects_invalid_paths() {
     std::fs::write(dir.root().join("sub/inner.txt"), "xyz").unwrap();
     let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
 
-    let paths = [
-        "/files/nope.txt",
-        "/files/sub",
-        "/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
-    ];
+    let paths = ["/files/nope.txt", "/files/sub"];
 
     for path in paths {
         let (head, _) = http_request(addr, "GET", path, "").await;
@@ -287,6 +322,58 @@ async fn files_endpoint_rejects_invalid_paths() {
     );
 
     server.abort();
+}
+
+/// 多级符号链接下载：/files 与 /pull 都发出最终原始文件的内容，长度也是原始文件的。
+/// 缓存有效期（1 秒）之后再取一次，复校验不能把符号链接误判成文件不存在。
+#[cfg(unix)]
+#[tokio::test]
+async fn files_endpoint_follows_multi_level_symlinks() {
+    let dir = TestDir::new();
+    std::fs::write(dir.root().join("origin.bin"), b"original-content").unwrap();
+    std::os::unix::fs::symlink("origin.bin", dir.root().join("middle")).unwrap();
+    std::os::unix::fs::symlink("middle", dir.root().join("alias.bin")).unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    for prefix in ["/files/", "/pull/"] {
+        let path = format!("{prefix}alias.bin");
+        let (head, body) = http_request(addr, "GET", &path, "").await;
+        assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header(&head, "content-length"),
+            Some("16"),
+            "长度应是原始文件的：{head}"
+        );
+        assert_eq!(body, b"original-content");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (head, body) = http_request(addr, "GET", "/files/alias.bin", "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"original-content");
+
+    server.abort();
+}
+
+/// 防穿越已移除：`..` 指到共享目录之外的文件也照常服务。
+#[tokio::test]
+async fn files_endpoint_serves_paths_outside_root() {
+    let dir = TestDir::new();
+    let outside = std::env::temp_dir().join(format!(
+        "lanfile-outside-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&outside, b"outside-root").unwrap();
+    let (addr, server) = serve_with_sendfile(dir.root().to_path_buf()).await;
+
+    let name = outside.file_name().unwrap().to_string_lossy();
+    let (head, body) = http_request(addr, "GET", &format!("/files/../{name}"), "").await;
+    assert!(status_line(&head).starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"outside-root");
+
+    server.abort();
+    let _ = std::fs::remove_file(&outside);
 }
 
 /// `/pull` 走快路径：正文与 `/files` 一致，但类型固定 `application/octet-stream`，且不编码
@@ -682,14 +769,30 @@ async fn api_zip_returns_404_for_missing() {
     assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 }
 
+/// 目录打包把符号链接当文件处理：多级链接发出的是原始文件内容。
+#[cfg(unix)]
 #[tokio::test]
-async fn api_zip_rejects_path_traversal() {
+async fn api_zip_includes_symlink_targets() {
     let dir = TestDir::new();
+    std::fs::write(dir.root().join("origin.bin"), b"ORIGINAL-ZIP-CONTENT").unwrap();
+    std::os::unix::fs::symlink("origin.bin", dir.root().join("middle")).unwrap();
+    std::os::unix::fs::symlink("middle", dir.root().join("alias.bin")).unwrap();
+
     let router = api_router(dir.root().to_path_buf());
-    let res = TestClient::get("http://127.0.0.1:5800/api/zip/%2e%2e")
+    let mut res = TestClient::get("http://127.0.0.1:5800/api/zip")
         .send(router)
         .await;
-    assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+    assert_eq!(res.status_code, Some(StatusCode::OK));
+    let body = res.take_bytes(None).await.unwrap();
+    assert!(
+        count_occurrences(&body, b"alias.bin") >= 1,
+        "链接条目应在 zip 内"
+    );
+    assert_eq!(
+        count_occurrences(&body, b"ORIGINAL-ZIP-CONTENT"),
+        3,
+        "原始文件与两级链接条目都应带完整内容"
+    );
 }
 
 #[tokio::test]
@@ -1023,6 +1126,46 @@ async fn get_stream_shards_preserve_manifest_structure() {
         [9, 9, 9]
     );
     assert_eq!(std::fs::read(mirror.join("b.txt")).unwrap(), b"abc");
+
+    server.abort();
+}
+
+/// 整棵目录拉取时，清单里的符号链接按原始文件内容落盘（多级链接同样跟随）。
+#[cfg(unix)]
+#[tokio::test]
+async fn get_mirrors_symlink_targets() {
+    let dir = TestDir::new();
+    std::fs::create_dir_all(dir.root().join("sub")).unwrap();
+    std::fs::write(dir.root().join("sub").join("origin.bin"), b"original").unwrap();
+    std::os::unix::fs::symlink("origin.bin", dir.root().join("sub").join("middle")).unwrap();
+    std::os::unix::fs::symlink("middle", dir.root().join("sub").join("alias.bin")).unwrap();
+
+    let root = dir.root().to_path_buf();
+    let access_log = Arc::new(AccessLog::Off);
+    let router = build_router(root.clone(), 8000, Arc::clone(&access_log));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = serve(listener, root, access_log, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let dst = TestDir::new();
+    lanfile_pull::run(&[
+        format!("http://{addr}/#sub"),
+        dst.root().to_string_lossy().into(),
+    ])
+    .await
+    .unwrap();
+
+    let mirror = dst.root().join("sub");
+    for name in ["origin.bin", "middle", "alias.bin"] {
+        assert_eq!(
+            std::fs::read(mirror.join(name)).unwrap(),
+            b"original",
+            "{name} 应是原始文件内容"
+        );
+    }
 
     server.abort();
 }

@@ -61,16 +61,18 @@
 
     entries.forEach(function (entry) {
       var row = document.createElement('tr');
+      var isDir = entry.type === 'dir';
+      var isLink = entry.type === 'link';
 
       var nameCell = document.createElement('td');
       row.appendChild(nameCell);
       nameCell.className = 'name-cell ' + entry.type;
       var icon = document.createElement('span');
-      icon.className = entry.type === 'dir' ? 'dir-icon' : 'file-icon';
+      icon.className = isDir ? 'dir-icon' : (isLink ? 'link-icon' : 'file-icon');
 
       var fp = joinPath(prefix, entry.name);
 
-      if (entry.type === 'dir') {
+      if (isDir) {
         nameCell.appendChild(icon);
         nameCell.appendChild(document.createTextNode(' ' + entry.name));
         nameCell.onclick = function () { navigate(fp); };
@@ -81,6 +83,14 @@
         link.appendChild(icon);
         link.appendChild(document.createTextNode(' ' + entry.name));
         nameCell.appendChild(link);
+        if (isLink) {
+          // 列表里只展示链接自身的元数据，明确标出这是符号链接；下载会跟随到原始文件
+          var badge = document.createElement('span');
+          badge.className = 'symlink-badge';
+          badge.textContent = '符号链接';
+          badge.title = '下载时传输被链接的原始文件（支持多级链接）';
+          nameCell.appendChild(badge);
+        }
       }
 
       var sizeCell = document.createElement('td');
@@ -97,13 +107,7 @@
       row.appendChild(linkCell);
       linkCell.className = 'link-group';
 
-      if (entry.type === 'file') {
-        var base = '/files/' + fp;
-        if (lanIp) {
-          linkCell.appendChild(makeCopyBtn('局域网', 'http://' + lanIp + ':' + port + base));
-        }
-        linkCell.appendChild(makeCopyBtn('本地', 'http://127.0.0.1:' + port + base));
-      } else {
+      if (isDir) {
         var zbase = '/api/zip/' + fp;
         var dl = document.createElement('a');
         dl.className = 'dl-link';
@@ -115,6 +119,13 @@
           linkCell.appendChild(makeCopyBtn('zip局域网', 'http://' + lanIp + ':' + port + zbase));
         }
         linkCell.appendChild(makeCopyBtn('zip本地', 'http://127.0.0.1:' + port + zbase));
+      } else {
+        // 符号链接也按文件给直链：/files 会跟随链接传输原始文件
+        var base = '/files/' + fp;
+        if (lanIp) {
+          linkCell.appendChild(makeCopyBtn('局域网', 'http://' + lanIp + ':' + port + base));
+        }
+        linkCell.appendChild(makeCopyBtn('本地', 'http://127.0.0.1:' + port + base));
       }
 
       frag.appendChild(row);

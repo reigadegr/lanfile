@@ -44,11 +44,16 @@ lanfile [port] [dir]
   "lan_ip": "192.168.1.20",
   "port": 9000,
   "entries": [
-    { "name": "a.txt", "type": "file", "size": 1234, "modified": "2025-01-01 12:00:00" },
-    { "name": "sub",   "type": "dir",  "size": null,  "modified": "2025-01-01 12:00:00" }
+    { "name": "a.txt",   "type": "file", "size": 1234, "modified": "2025-01-01 12:00:00" },
+    { "name": "sub",     "type": "dir",  "size": null, "modified": "2025-01-01 12:00:00" },
+    { "name": "alias",   "type": "link", "size": 8,    "modified": "2025-01-01 12:00:00" }
   ]
 }
 ```
+
+`type` 为 `link` 的是符号链接：`size` / `modified` 取链接自身的元数据，界面会标注「符号链接」。
+下载 `/files/<link>`（wget 等）时由内核跟随链接，多级链接也一路解析，传输的是最终原始
+文件的内容，响应长度按该原始文件给出；`/api/zip`、清单分片流同样按原始文件传输。
 
 ## 客户端 `lanfile get`
 

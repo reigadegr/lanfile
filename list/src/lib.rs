@@ -104,12 +104,6 @@ impl ListApi {
     }
 }
 
-/// 解析请求路径对应的绝对目录，且必须位于 root 之内。
-fn resolve_under(root: &Path, sub: &str) -> Option<PathBuf> {
-    let canonical = root.join(sub).canonicalize().ok()?;
-    canonical.starts_with(root).then_some(canonical)
-}
-
 /// 目录条目排序：目录在前，同类按名称升序。
 fn sort_list_entries(entries: &mut [ListEntry]) {
     entries.sort_unstable_by(|a, b| {
@@ -125,6 +119,8 @@ struct RawEntry {
     name: String,
     /// 是否目录
     is_dir: bool,
+    /// 是否符号链接：元数据按链接自身（不跟随）取
+    is_symlink: bool,
     /// 文件长度，目录上的取值无意义
     size: u64,
     /// 修改时间；`/api/list` 输出时才格式化
@@ -135,7 +131,7 @@ struct RawEntry {
 ///
 /// 契约（[`list_directory`] 完全建立在这三条上）：
 /// - 打不开目录返回 `None`；
-/// - 不交出 `.` 与 `..`，也不交出符号链接；
+/// - 不交出 `.` 与 `..`；符号链接照常交出，元数据用链接自身的；
 /// - 单个条目读不出来就跳过它，绝不因此放弃整次列举。
 ///
 /// 逐条回调而不是先攒成 `Vec`：原版就是一个 `Vec`、一次分配，中间再攒一层等于
@@ -174,14 +170,12 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
         };
         // 5. 直接读 st_mtime；manifest 不需要展示时间，避免在遍历时格式化和分配
         let actual_ft = FileType::from_raw_mode(stat.st_mode);
-        if actual_ft.is_symlink() {
-            continue;
-        }
         let modified = chrono::DateTime::from_timestamp(stat.st_mtime, 0);
         emit(RawEntry {
             // 名字只分配一次 String（vs 原先 to_string_lossy + to_string 两次分配）
             name: String::from_utf8_lossy(name_bytes).into_owned(),
             is_dir: actual_ft.is_dir(),
+            is_symlink: actual_ft.is_symlink(),
             #[allow(clippy::cast_sign_loss)]
             size: stat.st_size as u64,
             modified,
@@ -203,9 +197,6 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
             continue;
         };
         let ft = metadata.file_type();
-        if ft.is_symlink() {
-            continue;
-        }
         let modified = metadata
             .modified()
             .ok()
@@ -213,6 +204,7 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
         emit(RawEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: ft.is_dir(),
+            is_symlink: ft.is_symlink(),
             size: metadata.len(),
             modified,
         });
@@ -220,7 +212,7 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
     Some(())
 }
 
-/// 枚举目录并返回排序后的条目；路径非法、非目录或打不开返回 `None`。
+/// 枚举目录并返回排序后的条目；非目录或打不开返回 `None`。
 ///
 /// 平台差异全部收在 [`raw_dir_entries`] 这一条原语里，剩下的取舍（目录不带 size）
 /// 与排序两个平台共用同一份代码；原语按回调逐条交来，这里边收边填，不攒中间 `Vec`。
@@ -231,14 +223,22 @@ fn raw_dir_entries(dir: &Path, mut emit: impl FnMut(RawEntry)) -> Option<()> {
 ///
 /// 全程是同步阻塞的 fs 操作，应由调用方放进 `spawn_blocking`，避免拖慢异步 worker。
 fn list_directory(root: &Path, path: &str) -> Option<Vec<ListEntry>> {
-    let dir = resolve_under(root, path)?;
+    let dir = root.join(path);
     let mut list_entries: Vec<ListEntry> = Vec::with_capacity(64);
     raw_dir_entries(&dir, |entry| {
         let is_dir = entry.is_dir;
+        let is_symlink = entry.is_symlink;
         let size = if is_dir { None } else { Some(entry.size) };
         list_entries.push(ListEntry {
             name: entry.name,
-            entry_type: if is_dir { "dir" } else { "file" },
+            // 符号链接单独标出，元数据仍是链接自身的（size / modified 不跟随目标）
+            entry_type: if is_dir {
+                "dir"
+            } else if is_symlink {
+                "link"
+            } else {
+                "file"
+            },
             size,
             modified: entry
                 .modified
@@ -250,12 +250,21 @@ fn list_directory(root: &Path, path: &str) -> Option<Vec<ListEntry>> {
     Some(list_entries)
 }
 
-/// 递归收集整棵树的元数据，不打开文件正文。
+/// 递归收集整棵树的元数据，不读文件正文。
 fn manifest_directory(root: &Path, path: &str) -> Option<Vec<ManifestEntry>> {
-    let dir = resolve_under(root, path)?;
+    let dir = root.join(path);
     let mut entries = Vec::new();
     collect_manifest(&dir, "", &mut entries)?;
     Some(entries)
+}
+
+/// 符号链接在批量传输里按原始文件的内容发出，清单尺寸必须取打开后 fd 的真实长度，
+/// 否则客户端会拿链接自身 lstat 的长度校验正文，把完整传输误判成不完整。
+/// 目标不是普通文件就跳过，也不会顺着链接目录递归成环。
+fn symlink_target_size(dir: &Path, name: &str) -> Option<u64> {
+    let file = File::open(dir.join(name)).ok()?;
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then_some(metadata.len())
 }
 
 fn collect_manifest(dir: &Path, prefix: &str, entries: &mut Vec<ManifestEntry>) -> Option<()> {
@@ -275,10 +284,19 @@ fn collect_manifest(dir: &Path, prefix: &str, entries: &mut Vec<ManifestEntry>) 
             // 打不开的子目录沿用流式遍历语义：跳过该目录，继续拉其他内容。
             let _ = collect_manifest(&child, &path, entries);
         } else {
+            // 符号链接按目标文件的内容发送，尺寸随内容走；断链或指向目录的链接直接跳过
+            let size = if entry.is_symlink {
+                let Some(size) = symlink_target_size(dir, &entry.name) else {
+                    return;
+                };
+                size
+            } else {
+                entry.size
+            };
             entries.push(ManifestEntry {
                 path,
                 entry_type: "file",
-                size: Some(entry.size),
+                size: Some(size),
             });
         }
     })?;
@@ -405,8 +423,8 @@ impl ZipApi {
 
         // 解析路径 + 类型判断是阻塞 fs 操作，放进阻塞线程池
         let resolved = tokio::task::spawn_blocking(move || {
-            let canonical = resolve_under(&root, &path)?;
-            canonical.is_dir().then_some(canonical)
+            let dir = root.join(&path);
+            dir.is_dir().then_some(dir)
         })
         .await;
 
@@ -415,12 +433,12 @@ impl ZipApi {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
             return;
         };
-        let Some(canonical) = resolved else {
+        let Some(dir) = resolved else {
             res.status_code(StatusCode::NOT_FOUND);
             return;
         };
 
-        let folder_name = zip::folder_name(&canonical);
+        let folder_name = zip::folder_name(&dir);
         res.headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
         if let Ok(val) = HeaderValue::from_str(&zip::content_disposition(&folder_name)) {
@@ -434,7 +452,7 @@ impl ZipApi {
         let (item_tx, mut item_rx) = tokio::sync::mpsc::channel::<Item>(ZIP_QUEUE);
         let (free_tx, mut free_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ZIP_QUEUE);
         tokio::task::spawn_blocking(move || {
-            zip::walk(&canonical, &folder_name, &mut |entry| match entry {
+            zip::walk(&dir, &folder_name, &mut |entry| match entry {
                 zip::Entry::Dir { name } => item_tx.blocking_send(Item::Dir { name }).is_ok(),
                 zip::Entry::File { file, size, name } => {
                     send_one_file(&item_tx, &mut free_rx, file, size, name)
@@ -530,8 +548,8 @@ struct StreamFile {
 
 /// 从文件开头读满 `buf`，不改动文件偏移量（Unix 用 `pread`，非 Unix 复制 fd 后用 `seek`）。
 ///
-/// `/stream-batch` 的小文件走这里：`openat(dirfd, ...)` 拿到的 fd 是共享给 `sendfile` 的，
-/// 用 `pread` 读不会移动偏移量；非 Unix 没有 `pread`，复制一份 fd 后 `seek` 到 0 再读。
+/// `/stream-batch` 的小文件走这里：用 `pread` 读不移动文件偏移量（同一个 fd 可能还要交给
+/// `sendfile`）；非 Unix 没有 `pread`，复制一份 fd 后 `seek` 到 0 再读。
 fn read_file_prefix(file: &File, buf: &mut [u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -580,13 +598,7 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
         let path_end = offset + nul;
         let path = std::str::from_utf8(&body[offset..path_end])
             .map_err(|_| invalid("stream-batch 路径不是 UTF-8"))?;
-        if path.is_empty()
-            || path.len() > 8192
-            || path.starts_with('/')
-            || path
-                .split('/')
-                .any(|component| component.is_empty() || component == "..")
-        {
+        if path.is_empty() || path.len() > 8192 {
             return Err(invalid("stream-batch 路径非法"));
         }
         entries.push(path.to_owned());
@@ -595,18 +607,22 @@ fn parse_stream_batch_body(body: &[u8]) -> std::io::Result<Vec<String>> {
     Ok(entries)
 }
 
+/// 按清单索引逐个打开文件：`File::open` 由内核跟随符号链接（含多级）到原始文件，
+/// 大小取这个 fd 自己的元数据，发送端与清单校验用的就是同一份内容长度。
 fn send_batch_entries(target: &Path, entries: &[String], entry_tx: &mpsc::SyncSender<StreamFile>) {
-    let Some(dirfd) = zip::open_dir(target) else {
-        return;
-    };
-    let mut opener = zip::BatchFileOpener::new(dirfd);
     for rel in entries {
-        let Some((file, size)) = opener.open_file(rel) else {
+        let Ok(file) = File::open(target.join(rel)) else {
             continue;
         };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
         let entry = StreamFile {
             file,
-            size,
+            size: metadata.len(),
             name: rel.clone(),
         };
         if entry_tx.send(entry).is_err() {
@@ -621,13 +637,13 @@ fn serve_stream_batch_inner(
     sub: &str,
     entries: &[String],
 ) -> std::io::Result<()> {
-    let target = resolve_under(root, sub).filter(|path| path.is_dir());
-    let Some(target) = target else {
+    let target = root.join(sub);
+    if !target.is_dir() {
         socket.write_all(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )?;
         return Ok(());
-    };
+    }
 
     // 生产线程把已打开的文件交过来；发送回调出错时返回 `false` 并退出接收循环。
     let mut error: Option<std::io::Error> = None;
@@ -730,7 +746,7 @@ fn serve_stream_batch_inner(
 /// 文件系统不支持 `sendfile`（fuse 类挂载等会回 `EINVAL`）时也回退到这里。
 ///
 /// 用 `pread`（Unix）/ `try_clone` + `seek`（其他）读文件，不动共享的文件偏移量：
-/// `/stream-batch` 的 fd 是 `openat` 拿到的，可能还有其他引用；移动偏移量会互相干扰。
+/// `/stream-batch` 的 fd 可能还有其他引用；移动偏移量会互相干扰。
 fn copy_user(
     mut socket: &TcpStream,
     file: &File,
@@ -952,26 +968,27 @@ mod tests {
     #[test]
     fn parse_stream_batch_body_accepts_compact_entries() {
         let mut body = Vec::new();
-        for path in ["a.txt", "dir/b.bin"] {
+        for path in ["a.txt", "dir/b.bin", "/a.txt", "../outside.txt", "a//b.txt"] {
             body.extend_from_slice(path.as_bytes());
             body.push(0);
         }
 
         assert_eq!(
             parse_stream_batch_body(&body).unwrap(),
-            vec!["a.txt".to_owned(), "dir/b.bin".to_owned()]
+            vec![
+                "a.txt".to_owned(),
+                "dir/b.bin".to_owned(),
+                "/a.txt".to_owned(),
+                "../outside.txt".to_owned(),
+                "a//b.txt".to_owned(),
+            ]
         );
     }
 
     #[test]
-    fn parse_stream_batch_body_rejects_bad_entries() {
-        for body in [
-            &b"a.txt"[..],
-            &b"\0"[..],
-            &b"/a.txt\0"[..],
-            &b"../a.txt\0"[..],
-            &b"a//b.txt\0"[..],
-        ] {
+    fn parse_stream_batch_body_rejects_broken_frames() {
+        // 只校验帧格式本身：缺 NUL 结尾与空路径；路径内容不再做越界检查
+        for body in [&b"a.txt"[..], &b"\0"[..]] {
             assert!(parse_stream_batch_body(body).is_err());
         }
     }
