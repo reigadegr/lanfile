@@ -5,15 +5,20 @@
 //!
 //! 连接池可被多个调用共享（[`crate::http::Pool`] 内部有锁），所以入口只要 `&Pool`。
 
-use crate::error::Error;
-use crate::http::{Pool, READ_TIMEOUT, http_get};
+use std::{
+    io::{self, Read as _, Write as _},
+    path::{Path, PathBuf},
+};
+
 use serde::Deserialize;
-use std::io::{self, Read as _, Write as _};
-use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt as _, BufReader};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::splice::{Moved, transfer};
+use crate::{
+    error::Error,
+    http::{Pool, READ_TIMEOUT, http_get},
+};
 
 /// 每块搬运的字节数：一次同步 `read` + 一次同步 `write` 处理这么多，够摊薄系统调用。
 const COPY_BUF: usize = 64 * 1024;
@@ -284,9 +289,12 @@ pub fn encode_path(path: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use tokio::{
+        io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+        net::TcpStream,
+    };
+
     use super::*;
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-    use tokio::net::TcpStream;
 
     /// 把请求头读到空行即止（GET 无正文）；`BufReader` 把整段请求吃进缓冲，读完恰好干净。
     async fn read_request(reader: &mut BufReader<TcpStream>) {

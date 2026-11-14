@@ -3,8 +3,6 @@
 
 mod chunked_file;
 
-use std::cmp;
-use std::fs::{File, Metadata};
 #[cfg(not(unix))]
 use std::io::Read as StdRead;
 #[cfg(not(unix))]
@@ -13,23 +11,34 @@ use std::io::{Seek as StdSeek, SeekFrom};
 use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    cmp,
+    fs::{File, Metadata},
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use enumflags2::{BitFlags, bitflags};
 use mime::Mime;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use salvo::http::body::ResBody;
-use salvo::http::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_TYPE, IF_NONE_MATCH, LAST_MODIFIED, RANGE,
-    X_CONTENT_TYPE_OPTIONS,
+use salvo::{
+    Error, Result,
+    http::{
+        HttpRange, Response, StatusCode,
+        body::ResBody,
+        header::{
+            ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_TYPE, IF_NONE_MATCH, LAST_MODIFIED, RANGE,
+            X_CONTENT_TYPE_OPTIONS,
+        },
+        headers::{
+            ContentLength, ContentRange, ETag, HeaderMap, HeaderMapExt, HeaderValue, IfMatch,
+            IfModifiedSince, IfNoneMatch, IfUnmodifiedSince, LastModified,
+        },
+        mime::{detect_text_mime, fill_mime_charset_if_need, is_charset_required_mime},
+    },
 };
-use salvo::http::headers::*;
-use salvo::http::mime::{detect_text_mime, fill_mime_charset_if_need, is_charset_required_mime};
-use salvo::http::{HttpRange, Response, StatusCode};
-use salvo::{Error, Result};
 
 use crate::chunked_file::ChunkedFile;
 
@@ -161,7 +170,9 @@ impl FileMeta {
 
     /// 修改时间，语义与 [`std::fs::Metadata::modified`] 一致：1970 年之前的 mtime 会得到
     /// 一个早于 `UNIX_EPOCH` 的时间，调用方据此跳过 `Last-Modified` 与 `ETag`。
-    #[must_use]
+    // mtime_nsec 来自内核 timespec，恒在 [0, 1e9)；mtime 为负时走下面的单独分支，
+    // 因此这里的三处有符号 -> 无符号转换不会丢符号。
+    #[allow(clippy::cast_sign_loss)]
     pub fn modified(&self) -> std::io::Result<SystemTime> {
         if self.mtime >= 0 {
             return Ok(UNIX_EPOCH + Duration::new(self.mtime as u64, self.mtime_nsec as u32));
@@ -223,6 +234,31 @@ pub struct NamedFile {
     /// 调用方已经算好的 `ETag`：命中缓存时由 [`NamedFile::set_etag`] 给出，
     /// 这样每请求就不必再 `format!` 一次再解析回来。
     etag_override: Option<ETag>,
+}
+
+/// `build_inner` 打开文件后带出来的中间结果。
+struct FileInfo {
+    file: Arc<File>,
+    metadata: FileMeta,
+    preread: Option<Vec<u8>>,
+    detection_sample: DetectionSample,
+}
+
+/// 字符集探测所需的样本：要么借用预读缓冲，要么自己持有一小段。
+enum DetectionSample {
+    Empty,
+    Preread(usize),
+    Owned(Vec<u8>),
+}
+
+impl DetectionSample {
+    fn as_slice<'a>(&'a self, preread: &'a [u8]) -> &'a [u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Preread(end) => &preread[..*end],
+            Self::Owned(sample) => sample,
+        }
+    }
 }
 
 /// [`NamedFile`] 的构建器。
@@ -308,6 +344,13 @@ impl NamedFileBuilder {
     }
 
     /// Shared implementation of [`Self::build`] and the `build_from_file*` variants.
+    // 这两个方法目前没有 `.await`，但对外仍是 async API：调用方统一 `.await`，
+    // 且 body 里插阻塞式文件 IO 时不必再改签名。函数长度由协议分支决定，拆开反而难读。
+    #[allow(
+        clippy::too_many_lines,
+        clippy::unused_async,
+        clippy::unused_async_trait_impl
+    )]
     async fn build_inner(
         self,
         file: Option<Arc<File>>,
@@ -320,7 +363,10 @@ impl NamedFileBuilder {
             flags,
         } = self;
 
-        let preload_threshold = preload_threshold.unwrap_or(PRELOAD_THRESHOLD);
+        let preload_threshold = match preload_threshold {
+            Some(threshold) => threshold,
+            None => PRELOAD_THRESHOLD,
+        };
 
         // Determine what charset detection is needed before the blocking call.
         let inferred_mime = content_type
@@ -337,28 +383,6 @@ impl NamedFileBuilder {
         // 而 tokio 的 blocking pool 只有一把全局 Mutex + Condvar，每次派发都要抢锁并唤醒线程，
         // 压测下来这一次 spawn_blocking 就占掉每请求约 4 次 futex 等待，比它省下的阻塞还贵。
         // open/metadata 命中页缓存时是微秒级，因此直接在 worker 上同步执行。
-        struct FileInfo {
-            file: Arc<File>,
-            metadata: FileMeta,
-            preread: Option<Vec<u8>>,
-            detection_sample: DetectionSample,
-        }
-
-        enum DetectionSample {
-            Empty,
-            Preread(usize),
-            Owned(Vec<u8>),
-        }
-
-        impl DetectionSample {
-            fn as_slice<'a>(&'a self, preread: &'a [u8]) -> &'a [u8] {
-                match self {
-                    Self::Empty => &[],
-                    Self::Preread(end) => &preread[..*end],
-                    Self::Owned(sample) => sample,
-                }
-            }
-        }
         let info = (|| -> std::io::Result<FileInfo> {
             // 调用方可能已经打开过这个文件，那就直接用它，不要再按路径打开一次。
             let file = match file {
@@ -426,19 +450,27 @@ impl NamedFileBuilder {
         let content_type = if let Some(mime) = inferred_mime {
             if needs_charset {
                 let mut mime = (*mime).clone();
-                let sample = info
-                    .detection_sample
-                    .as_slice(info.preread.as_deref().unwrap_or(&[]));
+                let preread = match info.preread.as_deref() {
+                    Some(preread) => preread,
+                    None => &[],
+                };
+                let sample = info.detection_sample.as_slice(preread);
                 fill_mime_charset_if_need(&mut mime, sample);
                 Arc::new(mime)
             } else {
                 mime
             }
         } else if needs_detect {
-            let sample = info
-                .detection_sample
-                .as_slice(info.preread.as_deref().unwrap_or(&[]));
-            Arc::new(detect_text_mime(sample).unwrap_or(mime::APPLICATION_OCTET_STREAM))
+            let preread = match info.preread.as_deref() {
+                Some(preread) => preread,
+                None => &[],
+            };
+            let sample = info.detection_sample.as_slice(preread);
+            let detected = match detect_text_mime(sample) {
+                Some(content_type) => content_type,
+                None => mime::APPLICATION_OCTET_STREAM,
+            };
+            Arc::new(detected)
         } else {
             Arc::new(mime::APPLICATION_OCTET_STREAM)
         };
@@ -478,10 +510,11 @@ fn is_scriptable_xml(content_type: &Mime) -> bool {
         // which are XML but carry no suffix. Compare only the segment before the
         // first hyphen, so a subtype merely starting with those letters — say
         // `xmlish` — is not swept along.
-        || subtype
-            .split_once('-')
-            .map_or(subtype, |(head, _)| head)
-            .eq_ignore_ascii_case("xml")
+        || (match subtype.split_once('-') {
+            Some((head, _)) => head,
+            None => subtype,
+        })
+        .eq_ignore_ascii_case("xml")
         // `text/xsl` is the legacy type that `<?xml-stylesheet ?>` itself names,
         // and browsers parse it as XML.
         || subtype.eq_ignore_ascii_case("xsl")
@@ -501,9 +534,10 @@ fn build_content_disposition(
         }
     };
     let content_disposition = if disposition_type == "attachment" {
-        let attached_name = file_path
-            .as_ref()
-            .file_name().map_or_else(|| "file".into(), |file_name| file_name.to_string_lossy().into_owned());
+        let attached_name = match file_path.as_ref().file_name() {
+            Some(file_name) => file_name.to_string_lossy().into_owned(),
+            None => "file".into(),
+        };
         let quoted_filename = escape_quoted_filename(&attached_name);
         if quoted_filename == attached_name {
             format!(r#"attachment; filename="{quoted_filename}""#)
@@ -666,6 +700,12 @@ impl NamedFile {
         self.send_inner(req_headers, res, false).await;
     }
 
+    // 同 `build_inner`：保持对外 async 形态，且条件/Range 分支本就长，不再机械拆分。
+    #[allow(
+        clippy::too_many_lines,
+        clippy::unused_async,
+        clippy::unused_async_trait_impl
+    )]
     async fn send_inner(mut self, req_headers: &HeaderMap, res: &mut Response, send_body: bool) {
         // 调用方给了算好的 ETag 就用它，否则按这份元数据现算
         let etag = if self.flags.contains(Flag::Etag) {
@@ -722,7 +762,10 @@ impl NamedFile {
         // （mime 0.3 的 `Source` 就是 `String`），每请求一次堆分配
         let borrowed_content_type;
         let effective_content_type = if res.headers().contains_key(CONTENT_TYPE) {
-            borrowed_content_type = res.content_type().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+            borrowed_content_type = match res.content_type() {
+                Some(content_type) => content_type,
+                None => mime::APPLICATION_OCTET_STREAM,
+            };
             &borrowed_content_type
         } else {
             &self.content_type
@@ -758,9 +801,10 @@ impl NamedFile {
                 .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         }
         if let Some(lm) = last_modified.and_then(|lm| self.encodable_last_modified(lm))
-            && !res.headers().contains_key(LAST_MODIFIED) {
-                res.headers_mut().typed_insert(LastModified::from(lm));
-            }
+            && !res.headers().contains_key(LAST_MODIFIED)
+        {
+            res.headers_mut().typed_insert(LastModified::from(lm));
+        }
         if let Some(etag) = etag {
             res.headers_mut().typed_insert(etag);
         }
@@ -868,9 +912,10 @@ fn http_date_precision(time: SystemTime) -> SystemTime {
         Err(err) => {
             let dur = err.duration();
             let secs = dur.as_secs() + u64::from(dur.subsec_nanos() > 0);
-            UNIX_EPOCH
-                .checked_sub(Duration::from_secs(secs))
-                .unwrap_or(time)
+            match UNIX_EPOCH.checked_sub(Duration::from_secs(secs)) {
+                Some(precise) => precise,
+                None => time,
+            }
         }
     }
 }
@@ -909,6 +954,9 @@ fn none_match(etag: Option<&ETag>, req_headers: &HeaderMap) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // 测试里直接用 expect/unwrap 报出失败原因，比逐层传 Result 更清楚。
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     async fn build(path: &Path) -> NamedFile {
@@ -1102,8 +1150,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_head_sets_headers_without_body() {
-        use salvo::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_TYPE};
-        use salvo::http::{HeaderMap, Response};
+        use salvo::http::{
+            HeaderMap, Response,
+            header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_TYPE},
+        };
 
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let path = temp_dir.path().join("hello.txt");
@@ -1129,8 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_etag_is_sent_instead_of_the_computed_one() {
-        use salvo::http::header::ETAG;
-        use salvo::http::{HeaderMap, Response};
+        use salvo::http::{HeaderMap, Response, header::ETAG};
 
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let path = temp_dir.path().join("hello.txt");
@@ -1154,8 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn etag_returns_none_for_pre_epoch_modified_time() {
-        use std::io::Write as _;
-        use std::time::Duration;
+        use std::{io::Write as _, time::Duration};
 
         let mut file = tempfile::NamedTempFile::new().expect("create temp file");
         file.write_all(b"hello").expect("write file");
@@ -1169,11 +1217,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_skips_last_modified_for_pre_epoch_modified_time() {
-        use std::io::Write as _;
-        use std::time::Duration;
+        use std::{io::Write as _, time::Duration};
 
-        use salvo::http::header::{IF_MODIFIED_SINCE, LAST_MODIFIED};
-        use salvo::http::{HeaderMap, Response};
+        use salvo::http::{
+            HeaderMap, Response,
+            header::{IF_MODIFIED_SINCE, LAST_MODIFIED},
+        };
 
         let mut file = tempfile::NamedTempFile::new().expect("create temp file");
         file.write_all(b"hello").expect("write file");
@@ -1199,19 +1248,16 @@ mod tests {
 
     #[tokio::test]
     async fn send_if_modified_since_uses_http_date_precision() {
-        use std::io::Write as _;
-        use std::time::Duration;
+        use std::{io::Write as _, time::Duration};
 
-        use salvo::http::header::IF_MODIFIED_SINCE;
-        use salvo::http::{HeaderMap, Response};
+        use salvo::http::{HeaderMap, Response, header::IF_MODIFIED_SINCE};
 
         let mut file = tempfile::NamedTempFile::new().expect("create temp file");
         file.write_all(b"hello").expect("write file");
         file.flush().expect("flush");
 
         let mut named = build(file.path()).await;
-        named.modified =
-            Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500));
+        named.modified = Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500));
         named.flags.remove(Flag::Etag);
 
         let mut headers = HeaderMap::new();
@@ -1227,19 +1273,16 @@ mod tests {
 
     #[tokio::test]
     async fn send_if_unmodified_since_uses_http_date_precision() {
-        use std::io::Write as _;
-        use std::time::Duration;
+        use std::{io::Write as _, time::Duration};
 
-        use salvo::http::header::IF_UNMODIFIED_SINCE;
-        use salvo::http::{HeaderMap, Response};
+        use salvo::http::{HeaderMap, Response, header::IF_UNMODIFIED_SINCE};
 
         let mut file = tempfile::NamedTempFile::new().expect("create temp file");
         file.write_all(b"hello").expect("write file");
         file.flush().expect("flush");
 
         let mut named = build(file.path()).await;
-        named.modified =
-            Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500));
+        named.modified = Some(UNIX_EPOCH + Duration::from_secs(100) + Duration::from_millis(500));
         named.flags.remove(Flag::Etag);
 
         let mut headers = HeaderMap::new();

@@ -33,17 +33,20 @@ mod progress;
 mod splice;
 mod streaming;
 
-pub use error::{BoxError, Error};
-
-use crate::args::{Kind, Parsed, parse_args};
-use crate::fetch::{ManifestEntry, Via, fetch_file, fetch_manifest};
-use crate::http::Pool;
-use crate::progress::SharedProgress;
-use crate::streaming::fetch_stream_shard;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     time::Instant,
+};
+
+pub use error::{BoxError, Error};
+
+use crate::{
+    args::{Kind, Parsed, parse_args},
+    fetch::{ManifestEntry, Via, fetch_file, fetch_manifest},
+    http::Pool,
+    progress::SharedProgress,
+    streaming::fetch_stream_shard,
 };
 
 /// 分片流固定使用 4 条连接。
@@ -199,7 +202,10 @@ async fn run_file(pool: &Pool, p: &Parsed) -> Result<(), BoxError> {
 async fn pull_file_run(pool: &Pool, p: &Parsed) -> Result<(), Error> {
     let started = Instant::now();
     let remote = &p.remote;
-    let name = basename(remote).unwrap_or("download");
+    let name = match basename(remote) {
+        Some(name) => name,
+        None => "download",
+    };
     let target = p.local.join(name);
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -446,8 +452,7 @@ mod tests {
 
     /// 跑 `iters` 次取平均纳秒，先热身 `iters/10` 次。
     fn time<R>(iters: u32, f: impl Fn() -> R) -> f64 {
-        use std::hint::black_box;
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
 
         for _ in 0..iters / 10 {
             black_box(f());

@@ -24,8 +24,7 @@
 //! a resumed download's offset is always the byte where the previous attempt
 //! broke off — retrying through that path would loop forever.
 
-use std::fs::File;
-use std::sync::Arc;
+use std::{fs::File, sync::Arc};
 
 use salvo::{
     http::{
@@ -69,9 +68,10 @@ pub fn upgrade_response(slot: &SendfileSlot, res: &mut Response, file: Arc<File>
     };
     // 正常路径不会有 Content-Range（带 Range 的请求已在 should_upgrade 处分流）。
     // 仍按头解析：这是 pub API，被直接用于 206 响应时不能从错误的位置开始发。
-    let offset = header_str(res, CONTENT_RANGE)
-        .and_then(range_start)
-        .unwrap_or(0);
+    let offset = match header_str(res, CONTENT_RANGE).and_then(range_start) {
+        Some(offset) => offset,
+        None => 0,
+    };
     let Some(body) = slot.arm(file, offset, len) else {
         return;
     };

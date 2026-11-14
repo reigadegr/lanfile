@@ -222,12 +222,18 @@ pub fn log_access(access_log: &AccessLog, req: &Request, res: &Response) {
     let path = req.uri().path();
     let ip = req.remote_addr().ip();
     let version = req.version();
-    let status = res.status_code.map_or(200_u16, |c| c.as_u16());
-    let size = res
+    let status = match res.status_code {
+        Some(code) => code.as_u16(),
+        None => 200,
+    };
+    let size = match res
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+    {
+        Some(size) => size,
+        None => "-",
+    };
 
     let line = AccessLine {
         ip,

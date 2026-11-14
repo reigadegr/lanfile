@@ -250,18 +250,24 @@ async fn http_request(
         .unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(buf.len());
+    let split = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(at) => at,
+        None => buf.len(),
+    };
     let head = String::from_utf8_lossy(&buf[..split]).to_string();
-    let body = buf.get(split + 4..).unwrap_or(&[]).to_vec();
+    let body = match buf.get(split + 4..) {
+        Some(body) => body.to_vec(),
+        None => Vec::new(),
+    };
     (head, body)
 }
 
 /// 响应头里的状态行（第一行）。
 fn status_line(head: &str) -> &str {
-    head.split("\r\n").next().unwrap_or(head)
+    match head.split("\r\n").next() {
+        Some(line) => line,
+        None => head,
+    }
 }
 
 /// 响应头里某个字段的值（名字大小写不敏感）。
@@ -516,12 +522,15 @@ async fn read_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) 
         head.push(byte[0]);
     }
     let head = String::from_utf8_lossy(&head).to_string();
-    let len = head
+    let len = match head
         .lines()
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    {
+        Some(len) => len,
+        None => 0,
+    };
     let mut body = vec![0_u8; len];
     stream.read_exact(&mut body).await.unwrap();
     (head, body)

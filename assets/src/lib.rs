@@ -1,6 +1,8 @@
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
+};
 
 use lanfile_namedfile::{FileMeta, NamedFile};
 use lanfile_sendfile::{SendfileSlot, should_upgrade, upgrade_response};
@@ -10,9 +12,12 @@ use rust_embed::RustEmbed;
 use rustix::fs::{self as rfs, Advice, FileType};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use salvo::http::header::CONTENT_DISPOSITION;
-use salvo::http::header::{LAST_MODIFIED, RANGE};
 use salvo::{
-    http::{HeaderValue, Method, headers::ETag},
+    http::{
+        HeaderValue, Method,
+        header::{LAST_MODIFIED, RANGE},
+        headers::ETag,
+    },
     prelude::*,
     routing::filters,
     serve_static::static_embed,
@@ -406,8 +411,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_follows_multi_level_symlinks() -> std::io::Result<()> {
-        use std::io::Read as _;
-        use std::os::unix::fs::symlink;
+        use std::{io::Read as _, os::unix::fs::symlink};
 
         let fixture = Fixture::new("links")?;
         std::fs::write(fixture.root.join("origin.txt"), b"original")?;

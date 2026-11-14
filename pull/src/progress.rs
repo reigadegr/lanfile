@@ -98,9 +98,10 @@ impl SharedProgress {
 
     #[cfg(test)]
     pub(crate) fn counts(&self) -> (u64, u64) {
-        self.inner.lock().map_or((0, 0), |progress| {
-            (progress.done_files, progress.done_bytes)
-        })
+        match self.inner.lock() {
+            Ok(progress) => (progress.done_files, progress.done_bytes),
+            Err(_) => (0, 0),
+        }
     }
 }
 
@@ -153,7 +154,10 @@ fn filled_units(done: u64, total: u64) -> usize {
     }
     let done = u128::from(done.min(total));
     let total = u128::from(total);
-    usize::try_from(done * BAR_WIDTH as u128 / total).unwrap_or(BAR_WIDTH)
+    match usize::try_from(done * BAR_WIDTH as u128 / total) {
+        Ok(units) => units,
+        Err(_) => BAR_WIDTH,
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

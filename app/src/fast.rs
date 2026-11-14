@@ -282,7 +282,10 @@ fn read_request_body(
 ) -> io::Result<Vec<u8>> {
     let mut length = None;
     for line in head[..head_len].split(|&byte| byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = match line.strip_suffix(b"\r") {
+            Some(stripped) => stripped,
+            None => line,
+        };
         if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"Content-Length:") {
             if length.is_some() {
                 return Err(io::Error::new(
@@ -297,8 +300,14 @@ fn read_request_body(
             length = Some(value);
         }
     }
-    let length = length.unwrap_or(0);
-    let received = head.get(head_len..).unwrap_or_default();
+    let length = match length {
+        Some(length) => length,
+        None => 0,
+    };
+    let received = match head.get(head_len..) {
+        Some(received) => received,
+        None => &[],
+    };
     let take = received.len().min(length);
     let mut body = Vec::with_capacity(length);
     body.extend_from_slice(&received[..take]);
@@ -400,9 +409,7 @@ pub async fn serve(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::borrow::Cow;
-    use std::io::Write as _;
-    use std::net::TcpListener;
+    use std::{borrow::Cow, io::Write as _, net::TcpListener};
 
     use super::{Prefix, read_request_body, read_request_head, route_path, sub_path};
 
@@ -528,8 +535,7 @@ mod tests {
     #[test]
     #[ignore = "微基准，需 cargo test --release -- --ignored 显式运行"]
     fn bench_prefix_match() {
-        use std::hint::black_box;
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
 
         fn time<R>(iters: u32, f: impl Fn() -> R) -> f64 {
             for _ in 0..iters / 10 {

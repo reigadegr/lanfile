@@ -1,16 +1,14 @@
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::mem::MaybeUninit;
 use std::{
     fs::File,
     io::{Read as _, Write as _},
     net::TcpStream,
     path::{Path, PathBuf},
-    sync::Arc,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::mem::MaybeUninit;
 
 use arc_swap::ArcSwap;
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
@@ -240,10 +238,10 @@ fn list_directory(root: &Path, path: &str) -> Option<Vec<ListEntry>> {
                 "file"
             },
             size,
-            modified: entry
-                .modified
-                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
-                .unwrap_or_default(),
+            modified: match entry.modified {
+                Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                None => String::new(),
+            },
         });
     })?;
     sort_list_entries(&mut list_entries);
@@ -307,7 +305,10 @@ fn collect_manifest(dir: &Path, prefix: &str, entries: &mut Vec<ManifestEntry>) 
 impl ListApi {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        let path = req.param::<String>("path").unwrap_or_default();
+        let path = match req.param::<String>("path") {
+            Some(path) => path,
+            None => String::new(),
+        };
         let root = self.root.clone();
         // 空路径时 `format!("/{path}")` 就是 `"/"`，不必再分一条分支
         let display_path = format!("/{path}");
@@ -341,7 +342,10 @@ struct ManifestApi {
 impl ManifestApi {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        let path = req.param::<String>("path").unwrap_or_default();
+        let path = match req.param::<String>("path") {
+            Some(path) => path,
+            None => String::new(),
+        };
         let root = self.root.clone();
         let Ok(manifest) =
             tokio::task::spawn_blocking(move || manifest_directory(&root, &path)).await
@@ -418,7 +422,10 @@ impl ZipApi {
 impl ZipApi {
     #[allow(clippy::needless_pass_by_ref_mut)]
     async fn handle(&self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        let path = req.param::<String>("path").unwrap_or_default();
+        let path = match req.param::<String>("path") {
+            Some(path) => path,
+            None => String::new(),
+        };
         let root = self.root.clone();
 
         // 解析路径 + 类型判断是阻塞 fs 操作，放进阻塞线程池
@@ -898,7 +905,10 @@ fn read_first_chunk(
     file: &mut File,
     free_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> (Vec<u8>, usize) {
-    let mut buf = free_rx.try_recv().unwrap_or_else(|_| vec![0_u8; ZIP_CHUNK]);
+    let mut buf = match free_rx.try_recv() {
+        Ok(buf) => buf,
+        Err(_) => vec![0_u8; ZIP_CHUNK],
+    };
     let mut len = 0;
     while len < ZIP_CHUNK {
         match file.read(&mut buf[len..]) {
@@ -922,9 +932,10 @@ fn send_file_chunks(
     chunk_size: usize,
 ) -> bool {
     loop {
-        let mut buf = free_rx
-            .try_recv()
-            .unwrap_or_else(|_| vec![0_u8; chunk_size]);
+        let mut buf = match free_rx.try_recv() {
+            Ok(buf) => buf,
+            Err(_) => vec![0_u8; chunk_size],
+        };
         // 归还的缓冲始终满长，这里只读不截断，才能原样复用
         debug_assert_eq!(buf.len(), chunk_size);
         match file.read(&mut buf) {

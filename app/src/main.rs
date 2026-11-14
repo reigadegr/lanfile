@@ -6,7 +6,7 @@ use std::{
     io::{self, IsTerminal},
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -61,11 +61,13 @@ fn current_second() -> i64 {
 /// Platforms without `CLOCK_REALTIME_COARSE` fall back to a real clock read.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn current_second() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(i64::MIN, |since_epoch| {
-            i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX)
-        })
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => match i64::try_from(since_epoch.as_secs()) {
+            Ok(secs) => secs,
+            Err(_) => i64::MAX,
+        },
+        Err(_) => i64::MIN,
+    }
 }
 
 /// 当前秒的时间戳文本，每秒只格式化一次，同一秒内的请求直接复用缓存。
@@ -175,7 +177,10 @@ fn sink_writer() -> &'static LogSink {
 /// 中毒只说明有线程在临界区里 panic 过，而临界区里只有一次 `Vec` 追加或一次取出，数据
 /// 仍然完整；日志不该因为一次 panic 就永久停摆，所以取回内部数据继续用。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl LogSink {
@@ -285,7 +290,10 @@ async fn main() {
         }
     }
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => EnvFilter::new("info"),
+    };
 
     let is_terminal = std::io::stdout().is_terminal();
     if let Err(error) = thread::Builder::new()
@@ -305,12 +313,15 @@ async fn main() {
         .init();
 
     let (port, dir) = parse_args(argv.into_iter().skip(1));
-    let root = std::fs::canonicalize(&dir).unwrap_or_else(|error| {
-        tracing::error!("无法访问目录 {:?}: {error}", dir);
-        // 进程马上退出，这一行不能留在缓冲里
-        let _ = io::Write::flush(&mut &SINK);
-        std::process::exit(1);
-    });
+    let root = match std::fs::canonicalize(&dir) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::error!("无法访问目录 {:?}: {error}", dir);
+            // 进程马上退出，这一行不能留在缓冲里
+            let _ = io::Write::flush(&mut &SINK);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(reason) = lanfile_sendfile::configure(&root) {
         tracing::warn!("sendfile 已关闭（{reason}）：文件正文改用 pread 发送");

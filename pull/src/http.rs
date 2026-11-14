@@ -5,11 +5,17 @@
 //! `/stream-batch` 不走这里：它没有 `Content-Length`、连接不复用，整条流程由 `crate::streaming`
 //! 用同步 IO 在一个阻塞线程里跑完。
 
+use std::{
+    sync::{Mutex, MutexGuard},
+    time::Duration,
+};
+
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+};
+
 use crate::error::Error;
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 /// 建连超时：远端在约定时间内没握上手就别耗着。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,7 +31,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// 取锁，中毒也照常返回：临界区里只有一次 `Vec` 增删，中毒后内部数据仍结构完整，
 /// 继续用是安全的——与 `main.rs`、`file_cache.rs` 的 `lock` 语义对齐。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// 可复用的 HTTP/1.1 keep-alive 连接池。
@@ -183,10 +192,10 @@ pub fn status_code(line: &str) -> Option<u16> {
     let rest = &bytes[memchr::memchr(b' ', bytes)? + 1..];
     let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;
     let token = &rest[start..];
-    let end = token
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(token.len());
+    let end = match token.iter().position(u8::is_ascii_whitespace) {
+        Some(at) => at,
+        None => token.len(),
+    };
     std::str::from_utf8(&token[..end]).ok()?.parse().ok()
 }
 
@@ -198,8 +207,7 @@ mod tests {
 
     /// 跑 `iters` 次取平均纳秒，先热身 `iters/10` 次。
     fn time<R>(iters: u32, f: impl Fn() -> R) -> f64 {
-        use std::hint::black_box;
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
 
         for _ in 0..iters / 10 {
             black_box(f());

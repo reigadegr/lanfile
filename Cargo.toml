@@ -35,6 +35,10 @@ cast_precision_loss = "allow"
 cast_possible_truncation = "allow"
 struct_excessive_bools = "allow"
 option_if_let_else = "allow"
+# clippy.toml 已禁用 unwrap_or/unwrap_or_default 等「静默默认值」，
+# 这两条 lint 反过来要求用它们改写显式 match，互相冲突，因此统一关掉。
+manual_unwrap_or = "allow"
+manual_unwrap_or_default = "allow"
 
 [profile.dev]
 debug = true

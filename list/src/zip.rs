@@ -1,7 +1,6 @@
-use std::{fmt::Write as _, fs::File, path::Path};
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::mem::MaybeUninit;
+use std::{fmt::Write as _, fs::File, path::Path};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, RawDir};
@@ -14,8 +13,10 @@ pub enum Entry {
 
 /// 取目录名作为 zip 内根前缀（也用于 Content-Disposition 文件名）。
 pub fn folder_name(dir: &Path) -> String {
-    dir.file_name()
-        .map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned())
+    match dir.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "root".into(),
+    }
 }
 
 /// 按名称排序目录条目，保证 zip 内顺序确定；两个平台的实现共用。
@@ -70,8 +71,10 @@ pub fn walk(dir: &Path, prefix: &str, on_entry: &mut impl FnMut(Entry) -> bool) 
         let zip_name = format!("{prefix}/{name}");
 
         let actual_ft = if ft == FileType::Unknown {
-            rfs::statat(&dirfd, &name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_or(ft, |stat| FileType::from_raw_mode(stat.st_mode))
+            match rfs::statat(&dirfd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                Err(_) => ft,
+            }
         } else {
             ft
         };
@@ -220,8 +223,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn walk_follows_multi_level_symlinks() {
-        use std::io::Read as _;
-        use std::os::unix::fs::symlink;
+        use std::{io::Read as _, os::unix::fs::symlink};
 
         let root = tmp_root("links");
         let _ = std::fs::remove_dir_all(&root);

@@ -23,12 +23,14 @@ use std::{
     time::Instant,
 };
 
-use crate::error::Error;
-use crate::fetch::{Via, encode_path};
-use crate::http::{CONNECT_TIMEOUT, READ_TIMEOUT, status_code};
-use crate::progress::{PROGRESS_INTERVAL_MS, SharedProgress};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::splice::{Moved, transfer_with_progress};
+use crate::{
+    error::Error,
+    fetch::{Via, encode_path},
+    http::{CONNECT_TIMEOUT, READ_TIMEOUT, status_code},
+    progress::{PROGRESS_INTERVAL_MS, SharedProgress},
+};
 
 /// 流式响应头部分的读取缓冲大小。
 ///

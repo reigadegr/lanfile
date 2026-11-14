@@ -1,9 +1,11 @@
-use std::fmt::{self, Debug, Formatter};
-use std::fs::File;
-use std::io::{Error as IoError, Result as IoResult};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::{
+    fmt::{self, Debug, Formatter},
+    fs::File,
+    io::{Error as IoError, Result as IoResult},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 
 use bytes::Bytes;
 use futures_util::stream::Stream;
@@ -58,7 +60,12 @@ pub struct ChunkedFile {
 
 impl ChunkedFile {
     /// Creates a reader for `total_size` bytes starting at `offset`.
-    pub(crate) const fn new(file: Arc<File>, offset: u64, total_size: u64, buffer_size: u64) -> Self {
+    pub(crate) const fn new(
+        file: Arc<File>,
+        offset: u64,
+        total_size: u64,
+        buffer_size: u64,
+    ) -> Self {
         Self {
             total_size,
             read_size: 0,
@@ -76,7 +83,8 @@ impl Debug for ChunkedFile {
             .field("read_size", &self.read_size)
             .field("buffer_size", &self.buffer_size)
             .field("offset", &self.offset)
-            .finish()
+            // fd 与读取状态不适合打进日志，只列出可观测的计数。
+            .finish_non_exhaustive()
     }
 }
 
@@ -154,8 +162,9 @@ fn read_exact_at(_file: &File, _buf: &mut [u8], _offset: u64) -> IoResult<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::*;
     use futures_util::StreamExt as _;
+
+    use super::*;
 
     #[tokio::test]
     async fn shared_file_streams_keep_their_offsets() {

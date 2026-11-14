@@ -7,15 +7,14 @@
 //!
 //! 分片降低并发锁竞争。条目按 LRU 淘汰，每片容量固定，避免 fd 数量无界增长。
 
-use std::path::Path;
 use std::{
     fs::File,
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
-use hashbrown::HashMap;
-use hashbrown::hash_map::RawEntryMut;
+use hashbrown::{HashMap, hash_map::RawEntryMut};
 use lanfile_namedfile::FileMeta;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
@@ -41,7 +40,10 @@ fn now_millis() -> i64 {
 /// 取锁，中毒也照常返回：临界区里只有 `Vec`/`HashMap` 增删查与 `Arc` 克隆，
 /// 中毒后内部数据仍结构完整，继续用是安全的——与 `main.rs` 的 `lock` 语义对齐。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 struct Entry {
@@ -256,11 +258,12 @@ impl FileCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{io::Read as _, os::unix::fs::MetadataExt};
+
     use mime::Mime;
     use salvo::http::{HeaderValue, headers::ETag};
-    use std::io::Read as _;
-    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
 
     fn text_plain() -> Arc<Mime> {
         Arc::new(match "text/plain; charset=utf-8".parse() {

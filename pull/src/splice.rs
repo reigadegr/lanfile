@@ -8,14 +8,15 @@
 //! 管道按 blocking 线程复用：`pipe_with` 一次要分配两个 fd 与一份内核 pipe 结构，一根管道在
 //! 同一个线程上可以跨多次 `transfer` 复用，一趟拉取下来只建一次。
 
+use std::{cell::RefCell, fs::File, io, net::TcpStream};
+
+use rustix::{
+    fd::OwnedFd,
+    io::Errno,
+    pipe::{PipeFlags, SpliceFlags, pipe_with, splice},
+};
+
 use crate::error::Error;
-use rustix::fd::OwnedFd;
-use rustix::io::Errno;
-use rustix::pipe::{PipeFlags, SpliceFlags, pipe_with, splice};
-use std::cell::RefCell;
-use std::fs::File;
-use std::io;
-use std::net::TcpStream;
 
 /// 一轮搬多少：管道容量（默认 64 KiB）就是单次 `splice` 的上限，取同一个数即可；与用户态
 /// 路径的块大小一致，"读满 `want` 即止"的语义两边相同。
@@ -148,10 +149,13 @@ fn drain(pipe_read: &OwnedFd, file: &File, want: usize) -> Result<(), Error> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        path::{Path, PathBuf},
+    };
+
     use super::*;
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-    use std::path::{Path, PathBuf};
 
     /// 建一条本地 TCP 连接，把 `payload` 从对端写进去，返回读端。
     ///

@@ -61,7 +61,10 @@ fn decision_for(root: &Path, forced: Option<&str>) -> Option<&'static str> {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Ok(stat) = rustix::fs::statfs(root)
-        && is_fuse_magic(u64::try_from(stat.f_type).unwrap_or(0))
+        && is_fuse_magic(match u64::try_from(stat.f_type) {
+            Ok(fs_type) => fs_type,
+            Err(_) => 0,
+        })
     {
         return Some("FUSE 文件系统");
     }

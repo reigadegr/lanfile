@@ -2,8 +2,9 @@
 //! 解析成 [`Parsed`]（host、remote、kind、local、flat）。裸 host 与直链两种来源都收口在这里，
 //! 是纯解析、无 IO。
 
-use crate::error::Error;
 use std::path::PathBuf;
+
+use crate::error::Error;
 
 /// 用法串：直链与裸 host 两种源共用同一个尾部（可选 `local_dir` 与 `--flat`）。
 const USAGE: &str = "用法: lanfile get <base_url|直链> [<remote_dir>] [local_dir] [--flat]";
@@ -56,10 +57,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, Error> {
         if pos.len() > 2 {
             return Err(Error::Malformed(USAGE));
         }
-        let remote = pos
-            .first()
-            .map(|s| s.trim_matches('/').to_string())
-            .unwrap_or_default();
+        let remote = match pos.first() {
+            Some(name) => name.trim_matches('/').to_string(),
+            None => String::new(),
+        };
         let local = pos.get(1).map(PathBuf::from);
         (remote, Kind::Auto, local)
     };
@@ -70,7 +71,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, Error> {
         ));
     }
     // 不给 local：命名远端/文件缺省当前目录。
-    let local = local.unwrap_or_else(|| PathBuf::from("."));
+    let local = match local {
+        Some(local) => local,
+        None => PathBuf::from("."),
+    };
     Ok(Parsed {
         base: src.base,
         host: src.host,
@@ -111,16 +115,25 @@ fn parse_source(url: &str) -> Result<Source, Error> {
         "base_url 必须以 http:// 开头（不支持 https）",
     ))?;
     // host 到第一个 `/`、`?` 或 `#` 为止——`http://h#frag` 这种没有 `/` 的写法也要切对。
-    let host_end = rest
-        .bytes()
-        .position(|b| matches!(b, b'/' | b'?' | b'#'))
-        .unwrap_or(rest.len());
+    let host_end = match rest.bytes().position(|b| matches!(b, b'/' | b'?' | b'#')) {
+        Some(at) => at,
+        None => rest.len(),
+    };
     let host = rest[..host_end].to_string();
     let tail = &rest[host_end..];
-    let after = tail.strip_prefix('/').unwrap_or(tail);
+    let after = match tail.strip_prefix('/') {
+        Some(after) => after,
+        None => tail,
+    };
     // `#` 之后是 fragment；路径到 `#` 前的第一个 `?` 为止——`?` 在 `#` 之后时归 fragment。
-    let (head, fragment) = after.split_once('#').unwrap_or((after, ""));
-    let path = head.split_once('?').map_or(head, |(path, _)| path);
+    let (head, fragment) = match after.split_once('#') {
+        Some((head, fragment)) => (head, fragment),
+        None => (after, ""),
+    };
+    let path = match head.split_once('?') {
+        Some((path, _)) => path,
+        None => head,
+    };
     Ok(Source {
         base: format!("http://{host}"),
         host,
@@ -158,7 +171,10 @@ fn direct_of(path: &str, fragment: &str) -> Option<Direct> {
     // 用户多写的查询串也算 fragment（`/#sub?x=1`），一并切掉。默认走清单并发。
     if path.is_empty() {
         let sub = fragment.trim_start_matches('/');
-        let sub = sub.split_once('?').map_or(sub, |(sub, _)| sub);
+        let sub = match sub.split_once('?') {
+            Some((head, _)) => head,
+            None => sub,
+        };
         if !sub.is_empty() {
             return Some(Direct {
                 remote: percent_decode(sub),
